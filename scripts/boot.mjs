@@ -1,15 +1,15 @@
 /*
  * scripts/boot.mjs — container bootstrap (Azure Container Instances deploy).
  *
- * 1. Seeds web/data/sku-variant-map.json from the PUBLIC Shopify storefront
- *    (/products.json pagination — no credentials required), using the same
- *    mapping logic as scripts/seed-sku-map.mjs.
- * 2. Starts server.js.
+ * 1. Starts server.js immediately (health endpoint live within seconds).
+ * 2. In the background, seeds data/sku-variant-map.json from the PUBLIC
+ *    Shopify storefront (/products.json pagination — no credentials), same
+ *    mapping logic as scripts/seed-sku-map.mjs. The map is built page by
+ *    page (catalog is large; full product payloads are never held in memory).
  *
- * If the storefront fetch fails the server still starts with an empty map
- * (convert fails loudly per spec; /healthz reports sku_map.entries so the
- * failure is visible). The server hot-reloads the map on mtime change, so a
- * later successful seed (manual or nightly job) takes effect without restart.
+ * The server hot-reloads the map on mtime change, so once the seed write
+ * lands, convert/add-by-SKU pick it up without a restart. Until then
+ * /healthz reports sku_map.entries and convert fails loudly per spec.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -18,28 +18,10 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SHOP = (process.env.SHOP_STOREFRONT || "https://www.portlandiaelectric.supply").replace(/\/+$/, "");
 const LIMIT = 250;
-const MAX_PAGES = 80; // safety cap: 20k products
-
+const MAX_PAGES = 120; // safety cap: 30k products
 const FREIGHT_RE = /pallet|freight/i;
 
-async function fetchAllProducts() {
-  const all = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const res = await fetch(`${SHOP}/products.json?limit=${LIMIT}&page=${page}`, {
-      headers: { "User-Agent": "pes-quote-proxy-boot/1.0" },
-    });
-    if (!res.ok) throw new Error(`storefront products.json page ${page}: HTTP ${res.status}`);
-    const data = await res.json();
-    const products = data.products || [];
-    all.push(...products);
-    console.log(`boot: fetched page ${page} (${products.length} products, total ${all.length})`);
-    if (products.length < LIMIT) break;
-  }
-  return all;
-}
-
-function buildMap(products) {
-  const map = {};
+function addPage(map, products) {
   for (const p of products) {
     const tags = Array.isArray(p.tags) ? p.tags : String(p.tags || "").split(",").map((t) => t.trim());
     const freight = tags.some((t) => FREIGHT_RE.test(t));
@@ -54,18 +36,47 @@ function buildMap(products) {
       };
     }
   }
-  return map;
 }
 
-try {
-  const products = await fetchAllProducts();
-  const map = buildMap(products);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function seedMapOnce() {
+  const map = {};
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const res = await fetch(`${SHOP}/products.json?limit=${LIMIT}&page=${page}`, {
+      headers: { "User-Agent": "pes-quote-proxy-boot/1.0" },
+    });
+    if (!res.ok) throw new Error(`storefront products.json page ${page}: HTTP ${res.status}`);
+    const data = await res.json();
+    const products = data.products || [];
+    addPage(map, products);
+    console.log(`boot: page ${page}: ${products.length} products, ${Object.keys(map).length} SKUs so far`);
+    if (products.length < LIMIT) break;
+    await sleep(400); // be polite to the storefront
+  }
   const out = path.join(root, "data", "sku-variant-map.json");
   fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, JSON.stringify(map));
+  const tmp = out + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(map));
+  fs.renameSync(tmp, out);
   console.log(`boot: wrote ${Object.keys(map).length} SKU mappings -> ${out}`);
-} catch (e) {
-  console.error("boot: SKU map seed failed, starting with existing/empty map:", e.message);
 }
 
+async function seedMapWithRetry() {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await seedMapOnce();
+      return;
+    } catch (e) {
+      console.error(`boot: SKU map seed attempt ${attempt} failed:`, e.message);
+      if (attempt < 3) await sleep(30000);
+    }
+  }
+  console.error("boot: SKU map seed gave up; server continues with existing/empty map (healthz shows entries)");
+}
+
+// 1) start the server first so /healthz answers during seeding
 await import(path.join(root, "server.js"));
+
+// 2) seed in the background; failures never take the server down
+seedMapWithRetry();
