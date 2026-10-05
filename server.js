@@ -40,7 +40,10 @@ function verifyProxySignature(query, secret) {
     .map((k) => `${k}=${Array.isArray(rest[k]) ? rest[k].join(",") : rest[k]}`)
     .join("");
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(signature)));
+  const sigBuf = Buffer.from(String(signature));
+  const digBuf = Buffer.from(digest);
+  // timingSafeEqual throws on length mismatch — reject malformed lengths as 401.
+  return sigBuf.length === digBuf.length && crypto.timingSafeEqual(digBuf, sigBuf);
 }
 
 // --- Per-IP token-bucket rate limiting (proxy routes only, /healthz exempt) ---
