@@ -43,6 +43,49 @@ function verifyProxySignature(query, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(signature)));
 }
 
+// --- Per-IP token-bucket rate limiting (proxy routes only, /healthz exempt) ---
+// capacity 60 = burst allowance; refill 1 token/sec = sustained 60 req/min.
+// Note: storefront-proxied traffic arrives from Shopify egress IPs, so all
+// shoppers sharing one Shopify egress IP share a bucket — 60/min sustained
+// with a 60 burst is ample for drawer/detail quote traffic per egress IP.
+const RATE_LIMIT = {
+  capacity: parseInt(process.env.RATE_LIMIT_BURST || "60", 10),
+  refillPerSec: parseFloat(process.env.RATE_LIMIT_PER_SEC || "1"), // 60/min sustained
+  buckets: new Map(),
+};
+
+function clientIp(req) {
+  // Caddy (the only reachable hop to this port) appends the true peer IP to
+  // X-Forwarded-For; take the LAST entry so a spoofed client header cannot
+  // steal another identity's bucket.
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const parts = String(xff).split(",").map((s) => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return req.socket.remoteAddress || "unknown";
+}
+
+function rateLimitOk(ip) {
+  const now = Date.now();
+  let b = RATE_LIMIT.buckets.get(ip);
+  if (!b) {
+    b = { tokens: RATE_LIMIT.capacity, ts: now };
+    RATE_LIMIT.buckets.set(ip, b);
+  }
+  b.tokens = Math.min(RATE_LIMIT.capacity, b.tokens + ((now - b.ts) / 1000) * RATE_LIMIT.refillPerSec);
+  b.ts = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+// Evict idle buckets every 5 min so the map cannot grow unbounded.
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [k, v] of RATE_LIMIT.buckets) if (v.ts < cutoff) RATE_LIMIT.buckets.delete(k);
+}, 5 * 60 * 1000).unref();
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -99,6 +142,12 @@ async function main() {
 
       if (!path.startsWith("/proxy/quotes")) {
         send(res, 404, { error: "not found" });
+        return;
+      }
+
+      // Rate limit first: floods get throttled regardless of signature state.
+      if (!rateLimitOk(clientIp(req))) {
+        send(res, 429, { error: "rate limit exceeded (60 req/min per source IP)" });
         return;
       }
 
