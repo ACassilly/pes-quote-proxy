@@ -17,7 +17,23 @@
  *   POST /proxy/quotes/:ref/delete           {email, confirm:true}  (P1 — cannot undo)
  *   POST /proxy/quotes/:ref/share            {email, mode: full|price_only|none, note?}  (P1)
  *   POST /proxy/quotes/:ref/share/revoke     {email, token?}  (P1 — revokes all when token omitted)
- *   GET  /proxy/quotes/shared/:token         token-gated masked view, NO email (P1)
+ *   GET  /proxy/quotes/shared/:token         token-gated masked view, NO email (P1);
+ *                                            also resolves Wave-1 15-min preview tokens
+ *   GET  /proxy/quotes/sku-search?q=…        Wave-1 — SKU/name typeahead (quick add)
+ *   POST /proxy/quotes/:ref/lines/bulk       Wave-1 — {email, text|lines, confirm}
+ *                                            preview (zero writes) or one idempotent batch commit
+ *   POST /proxy/quotes/:ref/copy             Wave-1 — {email} -> new quote #, fresh
+ *                                            7-day validity, lines + PO/Job + notes carry
+ *   POST /proxy/quotes/:ref/preview          Wave-1 — {email, mode, note?} -> ephemeral
+ *                                            15-min preview token (never touches share links)
+ *   GET  /proxy/quotes/:ref/pdf?email=…      Wave-1 — PES-branded quote PDF (P2-3);
+ *                                            optional ?mode=full|price_only|none
+ *   GET  /proxy/quotes/shared/:token/pdf     Wave-1 — shared-link PDF, masked per the
+ *                                            token's mode ("none" => zero prices/totals)
+ *   POST /proxy/quotes/ops/sweep             Wave-1 — manual run of the day-5-of-7
+ *                                            expiring-quote email sweep (also runs on a
+ *                                            12h in-process interval; mail rail STUBBED
+ *                                            unless RESEND_API_KEY is set — see mailer.js)
  *
  * Auth model: app-proxy requests are verified with the Shopify proxy HMAC
  * signature when SHOPIFY_APP_SECRET is set. Without it (local dev) the server
@@ -29,6 +45,7 @@ const crypto = require("crypto");
 const { loadConfig } = require("./config");
 const { AxisClient } = require("./axis");
 const { QuoteService, HttpError } = require("./quotes");
+const { OrderSyncService } = require("./order-sync");
 const skuMap = require("./sku-map");
 
 function verifyProxySignature(query, secret) {
@@ -123,13 +140,48 @@ function send(res, status, obj) {
   res.end(body);
 }
 
+function sendPdf(res, { buffer, filename }) {
+  res.writeHead(200, {
+    "Content-Type": "application/pdf",
+    "Content-Length": buffer.length,
+    "Content-Disposition": `attachment; filename="${String(filename).replace(/[^A-Za-z0-9._-]/g, "_")}"`,
+    "Cache-Control": "no-store",
+  });
+  res.end(buffer);
+}
+
 async function main() {
   const cfg = loadConfig();
   const axis = new AxisClient(cfg.odoo);
   const svc = new QuoteService(axis, cfg);
+  const orderSync = new OrderSyncService(axis, cfg);
 
   if (!cfg.shopify.appSecret) {
     console.warn("[proxy] SHOPIFY_APP_SECRET not set — LOCAL DEV MODE, proxy signatures not verified");
+  }
+  if (/^(1|true|yes)$/i.test(process.env.ORDER_SYNC_ENABLED || "")) {
+    orderSync.startLoop();
+  }
+
+  // Admin-token gate for ops routes (/admin/*). Disabled entirely (404) when
+  // ORDER_SYNC_ADMIN_TOKEN is unset; comparison is length-checked + constant-time.
+  const adminToken = process.env.ORDER_SYNC_ADMIN_TOKEN || null;
+  function adminOk(req) {
+    if (!adminToken) return false;
+    const given = Buffer.from(String(req.headers["x-admin-token"] || ""));
+    const want = Buffer.from(adminToken);
+    return given.length === want.length && crypto.timingSafeEqual(given, want);
+  }
+
+  // Wave-1: day-5-of-7 expiring-quote email sweep on a 12h in-process
+  // interval (first run 10 min after boot, so it doesn't race the SKU-map
+  // seed). Registry-guardrailed to proxy-touched quotes only; deduped per
+  // (order, validity). With the mail rail stubbed this only writes outbox
+  // rows — nothing is emailed until RESEND_API_KEY is set.
+  if (!/^(0|false|no)$/i.test(process.env.EXPIRY_SWEEP_ENABLED || "")) {
+    const runSweep = () => svc.sweepExpiringQuotes().catch((e) => console.warn("[sweep]", e.message));
+    setTimeout(runSweep, 10 * 60 * 1000).unref();
+    setInterval(runSweep, 12 * 60 * 60 * 1000).unref();
   }
 
   const server = http.createServer(async (req, res) => {
@@ -139,7 +191,37 @@ async function main() {
       const query = Object.fromEntries(u.searchParams.entries());
 
       if (path === "/healthz" && req.method === "GET") {
-        send(res, 200, { ok: true, sku_map: skuMap.stats(), dev_mode: !cfg.shopify.appSecret });
+        send(res, 200, {
+          ok: true,
+          sku_map: skuMap.stats(),
+          dev_mode: !cfg.shopify.appSecret,
+          mail_rail: svc.mailer.railStatus(), // "resend" or STUBBED "stubbed-no-rail"
+          order_sync: { configured: orderSync.configured(), loop_enabled: !!orderSync.timer },
+        });
+        return;
+      }
+
+      // Ops routes: admin-token gated, never Shopify-proxied. 404 when disabled.
+      if (path.startsWith("/admin/order-sync")) {
+        if (!adminOk(req)) {
+          send(res, adminToken ? 401 : 404, { error: adminToken ? "invalid admin token" : "not found" });
+          return;
+        }
+        if (!rateLimitOk(clientIp(req))) {
+          send(res, 429, { error: "rate limit exceeded" });
+          return;
+        }
+        if (path === "/admin/order-sync/status" && req.method === "GET") {
+          send(res, 200, orderSync.status());
+          return;
+        }
+        if (path === "/admin/order-sync/run" && req.method === "POST") {
+          const body = await readBody(req);
+          const out = await orderSync.runOnce({ dryRun: body.dry_run === true ? true : undefined });
+          send(res, 200, out);
+          return;
+        }
+        send(res, 404, { error: "not found" });
         return;
       }
 
@@ -165,8 +247,29 @@ async function main() {
       const action = parts[3] || null;
 
       // P1: token-gated shared quote view — no email, the token is the capability.
+      // Wave-1: also resolves ephemeral 15-min preview tokens (preview.js).
       if (ref === "shared" && action && req.method === "GET" && parts.length === 4) {
         send(res, 200, await svc.getSharedQuote(decodeURIComponent(action)));
+        return;
+      }
+
+      // Wave-1 (P2-3): shared-link PDF — masked per the token's stored mode.
+      // A "none" share yields a PDF with no prices and no totals anywhere.
+      if (ref === "shared" && action && parts[4] === "pdf" && req.method === "GET") {
+        sendPdf(res, await svc.getSharedQuotePdf(decodeURIComponent(action)));
+        return;
+      }
+
+      // Wave-1: manual expiring-email sweep trigger (signature-protected like
+      // every proxy route; the 12h in-process interval is the normal driver).
+      if (ref === "ops" && action === "sweep" && req.method === "POST") {
+        send(res, 200, await svc.sweepExpiringQuotes());
+        return;
+      }
+
+      // Wave-1: SKU/name typeahead for quote-detail Quick Add.
+      if (ref === "sku-search" && !action && req.method === "GET") {
+        send(res, 200, { results: skuMap.search(query.q || "", 8) });
         return;
       }
 
@@ -200,6 +303,19 @@ async function main() {
         const body = await readBody(req);
         requireEmail(body);
         send(res, 200, await svc.renameQuote(body.email, ref, body.name));
+        return;
+      }
+
+      if (ref && action === "lines" && parts[4] === "bulk" && req.method === "POST") {
+        // Wave-1 (P2-10): bulk paste/CSV quick-add. confirm falsy => preview
+        // (zero writes); confirm:true => one idempotent batch commit.
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await svc.bulkAddLines(body.email, ref, {
+          text: body.text,
+          lines: body.lines,
+          confirm: body.confirm === true,
+        }));
         return;
       }
 
@@ -245,6 +361,33 @@ async function main() {
         const body = await readBody(req);
         requireEmail(body);
         send(res, 200, await svc.revokeShare(body.email, ref, { token: body.token }));
+        return;
+      }
+
+      // ----- Wave-1 routes -----
+
+      if (ref && action === "copy" && req.method === "POST") {
+        // Make a Copy: new quote #, fresh 7-day validity, lines + PO/Job + notes carry.
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await svc.copyQuote(body.email, ref));
+        return;
+      }
+
+      if (ref && action === "preview" && req.method === "POST") {
+        // Preview as client: ephemeral 15-min token for the recipient view.
+        // Never creates/revokes a real share link.
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await svc.previewQuote(body.email, ref, { mode: body.mode, note: body.note }));
+        return;
+      }
+
+      if (ref && action === "pdf" && req.method === "GET") {
+        // Wave-1 (P2-3): owner PDF download. ?mode=full|price_only|none
+        // (default full) mirrors the Lowe's Download dialog masking modes.
+        requireEmail(query);
+        sendPdf(res, await svc.getQuotePdf(query.email, ref, { mode: query.mode || "full" }));
         return;
       }
 
