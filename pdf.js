@@ -94,16 +94,8 @@ function wrap(text, size, maxWidth, bold) {
 
 function loadLogo() {
   try {
-    // The JPEG is committed as base64 text (assets/pes-logo.b64) so the GitHub
-    // mirror deploy path never handles binary; decode at boot. Fall back to a
-    // raw .jpg when running from a full local checkout.
-    let buf;
-    const b64Path = path.join(__dirname, "assets", "pes-logo.b64");
-    if (fs.existsSync(b64Path)) {
-      buf = Buffer.from(fs.readFileSync(b64Path, "utf8").replace(/\s+/g, ""), "base64");
-    } else {
-      buf = fs.readFileSync(path.join(__dirname, "assets", "pes-logo.jpg"));
-    }
+    const p = path.join(__dirname, "assets", "pes-logo.jpg");
+    const buf = fs.readFileSync(p);
     // Parse SOF0/SOF2 for dimensions.
     let i = 2;
     while (i + 9 < buf.length) {
