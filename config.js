@@ -74,6 +74,13 @@ function loadConfig() {
     // Display-only volume-pricing progress bar (P1). The discount itself stays
     // an Axis pricelist decision; bar hidden on contract-priced quotes.
     volumeThreshold: parseFloat(process.env.VOLUME_THRESHOLD || "2000"),
+    // Quote lifecycle emails (Wave-1). THE mail rail switch: RESEND_API_KEY.
+    // Without it the mailer composes + queues to data/email-outbox.json and
+    // sends NOTHING (stubbed). MAIL_FROM defaults to the sales@ mailbox used
+    // by the three live order-notification templates (DMARC is set).
+    resendApiKey: process.env.RESEND_API_KEY || null,
+    mailFrom: process.env.MAIL_FROM || "PES Supply <sales@portlandiaelectric.supply>",
+    storefrontUrl: (process.env.STOREFRONT_URL || "https://www.portlandiaelectric.supply").replace(/\/+$/, ""),
   };
 }
 
