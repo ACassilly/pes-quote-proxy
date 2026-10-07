@@ -1,11 +1,15 @@
 {
-	# Let's Encrypt's duplicate-certificate limit (5 per exact identifier set
-	# per 168h) was exhausted 2026-10-07 by repeated container-group recreations
-	# (the caddy-data volume is emptyDir, so every recreation re-issues).
-	# Buypass Go SSL's ACME directory is dead (HTTP 404, service discontinued),
-	# so TLS automation uses Actalis — a publicly trusted CA offering free ACME
-	# DV issuance with no EAB and an independent rate-limit pool.
-	acme_ca https://acme-api.actalis.com/acme/directory
+	# TLS issuer history for pes-quote-proxy.eastus.azurecontainer.io:
+	# - Let's Encrypt: duplicate-certificate limit (5 per identifier per 168h)
+	#   exhausted 2026-10-07 by repeated container-group recreations (the
+	#   caddy-data volume is emptyDir, so every recreation re-issues).
+	# - Buypass Go SSL: ACME directory dead (HTTP 404, service discontinued).
+	# - Actalis: directory now demands external account binding
+	#   (HTTP 403 externalAccountRequired, observed 2026-10-07) — unusable.
+	# ZeroSSL's ACME directory issues free DV certs and Caddy auto-registers
+	# the required EAB credentials from the contact email below — no manual
+	# account step — with an independent rate-limit pool from Let's Encrypt.
+	acme_ca https://acme.zerossl.com/v2/DV90
 	email sales@portlandiaelectric.supply
 }
 
