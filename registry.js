@@ -30,14 +30,21 @@ function save(reg) {
   fs.renameSync(tmp, REG_PATH);
 }
 
-/** Record (or refresh) a quote the proxy has touched. */
-function record({ orderId, email, quoteNo, name, validityDate }) {
+/**
+ * Record (or refresh) a quote the proxy has touched.
+ * Wave-2A: `convertedAt` marks the moment a quote was converted to a cart —
+ * that is what the job-scoped reorder surface (reorder.js) lists as a "past
+ * converted quote". A later plain record never clears a prior converted_at.
+ */
+function record({ orderId, email, quoteNo, name, validityDate, convertedAt }) {
   const reg = load();
+  const prev = reg[String(orderId)] || {};
   reg[String(orderId)] = {
     email: String(email || "").toLowerCase(),
     quote_no: quoteNo || null,
     name: name || null,
     validity_date: validityDate || null,
+    converted_at: convertedAt || prev.converted_at || null,
     touched_at: new Date().toISOString(),
   };
   save(reg);
