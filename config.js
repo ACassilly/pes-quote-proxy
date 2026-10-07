@@ -81,6 +81,12 @@ function loadConfig() {
     resendApiKey: process.env.RESEND_API_KEY || null,
     mailFrom: process.env.MAIL_FROM || "PES Supply <sales@portlandiaelectric.supply>",
     storefrontUrl: (process.env.STOREFRONT_URL || "https://www.portlandiaelectric.supply").replace(/\/+$/, ""),
+    // Wave-2B (P2-12): quote approval threshold. A quote whose total reaches
+    // this amount enters "pending approval" at conversion time; the approver
+    // gets an outbox email with a single-use 72h approve link. <= 0 disables
+    // the gate. Unknown approval state fails CLOSED (not convertible).
+    quoteApprovalMin: parseFloat(process.env.QUOTE_APPROVAL_MIN || "10000"),
+    quoteApproverEmail: process.env.QUOTE_APPROVER_EMAIL || "sales@portlandiaelectric.supply",
   };
 }
 

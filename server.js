@@ -34,6 +34,24 @@
  *                                            expiring-quote email sweep (also runs on a
  *                                            12h in-process interval; mail rail STUBBED
  *                                            unless RESEND_API_KEY is set — see mailer.js)
+ *   GET  /proxy/quotes/reorder/history?email=…&q=…
+ *                                            Wave-2A (P2-11) — past converted quotes +
+ *                                            order history, searchable by quote name /
+ *                                            PO / job name / order # (email-identity
+ *                                            trust model, same as the quotes list)
+ *   POST /proxy/quotes/reorder               Wave-2A (P2-11) — {email, source:{type:
+ *                                            quote|order, ref}} -> new quote at ORIGINAL
+ *                                            prices when every item still exists, else a
+ *                                            current-price cart permalink with a visible
+ *                                            "prices updated" notice
+ *   POST /proxy/quotes/from-cart             Wave-2A (P2-5) — {email, name, lines:
+ *                                            [{sku, qty}]} -> copy the cart into a new
+ *                                            named draft quote; the cart is NEVER
+ *                                            emptied; only sku+qty are accepted (client
+ *                                            prices are ignored — Axis owns price)
+ *   POST /proxy/quotes/:ref/convert          Wave-2A: a successful convert now also marks
+ *                                            the quote as a past converted quote for the
+ *                                            reorder surface (proxy registry)
  *
  * Auth model: app-proxy requests are verified with the Shopify proxy HMAC
  * signature when SHOPIFY_APP_SECRET is set. Without it (local dev) the server
@@ -45,6 +63,7 @@ const crypto = require("crypto");
 const { loadConfig } = require("./config");
 const { AxisClient } = require("./axis");
 const { QuoteService, HttpError } = require("./quotes");
+const { ReorderService } = require("./reorder");
 const { OrderSyncService } = require("./order-sync");
 const skuMap = require("./sku-map");
 
@@ -150,10 +169,30 @@ function sendPdf(res, { buffer, filename }) {
   res.end(buffer);
 }
 
+// Wave-2B: approval confirmation page (clicked from the approver email).
+function sendHtml(res, status, { title, message, ok }) {
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const body = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${esc(title)} — PES Supply</title></head>
+<body style="margin:0;background:#f2f4f7;font-family:Arial,Helvetica,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" style="padding:48px 12px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width:600px;max-width:100%;background:#ffffff;border-radius:8px;">
+<tr><td style="padding:32px;">
+<div style="font-size:22px;font-weight:800;color:#1d6b3f;margin-bottom:16px;">PES Supply</div>
+<div style="font-size:24px;font-weight:800;color:${ok ? "#111111" : "#8a5a00"};line-height:1.25;">${esc(title)}</div>
+<p style="font-size:15px;color:#444444;line-height:1.55;">${message}</p>
+<p style="font-size:13px;color:#777777;">Questions? Write to <a href="mailto:sales@portlandiaelectric.supply" style="color:#1d6b3f;">sales@portlandiaelectric.supply</a>.</p>
+</td></tr></table></td></tr></table></body></html>`;
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(body);
+}
+
 async function main() {
   const cfg = loadConfig();
   const axis = new AxisClient(cfg.odoo);
   const svc = new QuoteService(axis, cfg);
+  const w2a = new ReorderService(svc, cfg); // Wave-2A: reorder + save-cart-as-quote
   const orderSync = new OrderSyncService(axis, cfg);
 
   if (!cfg.shopify.appSecret) {
@@ -196,6 +235,7 @@ async function main() {
           sku_map: skuMap.stats(),
           dev_mode: !cfg.shopify.appSecret,
           mail_rail: svc.mailer.railStatus(), // "resend" or STUBBED "stubbed-no-rail"
+          quote_approval_min: cfg.quoteApprovalMin, // Wave-2B (P2-12) threshold
           order_sync: { configured: orderSync.configured(), loop_enabled: !!orderSync.timer },
         });
         return;
@@ -273,6 +313,75 @@ async function main() {
         return;
       }
 
+      // ----- Wave-2A routes (job-scoped reorder + save-cart-as-quote) -----
+
+      // Wave-2A (P2-11): reorder history — past converted quotes + order
+      // history, searchable by quote name / PO / job name / order #.
+      // TRUST: same email-identity model as the quotes list (see reorder.js).
+      if (ref === "reorder" && action === "history" && req.method === "GET") {
+        requireEmail(query);
+        send(res, 200, await w2a.reorderHistory(query.email, query.q || ""));
+        return;
+      }
+
+      // Wave-2A (P2-11): execute a reorder. Honored original pricing via a new
+      // quote when every item still exists; current-price cart permalink with
+      // a visible "prices updated" notice when anything changed.
+      if (ref === "reorder" && !action && req.method === "POST") {
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await w2a.reorder(body.email, body.source || {}));
+        return;
+      }
+
+      // Wave-2A (P2-5): Save Cart as Quote — COPY semantics: the cart is never
+      // emptied; only sku+qty are accepted from the client (prices are
+      // computed server-side at quote time — client prices are ignored).
+      if (ref === "from-cart" && !action && req.method === "POST") {
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await w2a.saveCartAsQuote(body.email, body));
+        return;
+      }
+
+      // Wave-2B (P2-12): approver link target. The single-use 72h token is the
+      // capability — no email/login required (the approver clicks from email).
+      // Served through the Shopify-signed proxy path (/apps/quotes/approve),
+      // so HMAC verification above still applies. ALWAYS returns HTML.
+      if (ref === "approve" && !action && req.method === "GET") {
+        try {
+          const out = await svc.approveQuoteByToken(query.token);
+          sendHtml(res, 200, {
+            ok: true,
+            title: `Quote ${out.quote_no || ""} approved`,
+            message: "The quote is approved and checkout is now unlocked for the customer. You can close this tab.",
+          });
+        } catch (e) {
+          const status = e.status || 400;
+          sendHtml(res, status, { ok: false, title: "Approval link not accepted", message: e.message });
+        }
+        return;
+      }
+
+      // Wave-2B (#109): customer part-number aliases (self-service per email).
+      if (ref === "aliases" && !action && req.method === "GET") {
+        requireEmail(query);
+        send(res, 200, await svc.listAliases(query.email));
+        return;
+      }
+      if (ref === "aliases" && !action && req.method === "POST") {
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await svc.addAlias(body.email, body.customer_sku, body.our_sku));
+        return;
+      }
+      if (ref === "aliases" && action === "remove" && req.method === "POST") {
+        const body = await readBody(req);
+        requireEmail(body);
+        send(res, 200, await svc.removeAlias(body.email, body.customer_sku));
+        return;
+      }
+
       if (!ref && req.method === "POST") {
         const body = await readBody(req);
         requireEmail(body);
@@ -329,7 +438,12 @@ async function main() {
       if (ref && action === "convert" && req.method === "POST") {
         const body = await readBody(req);
         requireEmail(body);
-        send(res, 200, await svc.convertQuote(body.email, ref));
+        const out = await svc.convertQuote(body.email, ref);
+        // Wave-2A: a successful conversion (permalink issued) marks the quote
+        // as a "past converted quote" on the reorder surface. Fire-and-forget;
+        // a failure here never breaks the conversion itself.
+        w2a.recordConversion(body.email, ref, out).catch(() => {});
+        send(res, 200, out);
         return;
       }
 

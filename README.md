@@ -32,6 +32,10 @@ production; unset = local dev mode with a logged warning),
 and queued to `data/email-outbox.json` but NOTHING is sent),
 `MAIL_FROM`, `STOREFRONT_URL`, `EXPIRY_SWEEP_ENABLED` (default on; 12h
 in-process day-5-of-7 expiring-quote sweep),
+`QUOTE_APPROVAL_MIN` (Wave-2B approval threshold, default `10000`; `<=0`
+disables the gate; unknown approval state fails CLOSED = not convertible),
+`QUOTE_APPROVER_EMAIL` (default `sales@portlandiaelectric.supply`),
+`QUOTE_APPROVAL_TOKEN_HOURS` (approve-link TTL, default `72`, single-use),
 `ORDER_SYNC_ENABLED`, `ORDER_SYNC_ADMIN_TOKEN` (Stitch-2 Shopify→Axis order
 sync; loop off and admin routes 404 unless set).
 
@@ -58,6 +62,20 @@ sync; loop off and admin routes 404 unless set).
 | `GET /proxy/quotes/:ref/pdf?email=…&mode=…` | — | **Wave-1 (P2-3)** — PES-branded quote PDF; `mode=full\|price_only\|none` mirrors the share masking modes |
 | `GET /proxy/quotes/shared/:token/pdf` | — | **Wave-1** — shared-link PDF masked per the token's stored mode (`none` => zero prices/totals); preview tokens resolve too |
 | `POST /proxy/quotes/ops/sweep` | — | **Wave-1** — manual run of the day-5-of-7 expiring-quote email sweep (registry-guardrailed, deduped; outbox-only while the mail rail is stubbed) |
+| `GET /proxy/quotes/approve?token=…` | — | **Wave-2B (P2-12)** — approver link target from the approval email. Single-use, 72h token is the capability (no login); marks the quote convertible and returns an HTML confirmation. Expired/used/unknown tokens fail with a clear page and NEVER mutate state |
+| `GET /proxy/quotes/aliases?email=…` | — | **Wave-2B (#109)** — list the customer's part-number aliases |
+| `POST /proxy/quotes/aliases` | `{email, customer_sku, our_sku}` | **Wave-2B (#109)** — add/overwrite an alias (`our_sku` validated against the catalog map) |
+| `POST /proxy/quotes/aliases/remove` | `{email, customer_sku}` | **Wave-2B (#109)** — remove an alias |
+
+**Wave-2B behaviors:** conversion of a quote whose total reaches
+`QUOTE_APPROVAL_MIN` is gated — the quote enters "pending approval" (Axis
+sale.order tag/note flag + proxy state in `data/quote-approvals.json`), the
+approver gets an outbox email (same stubbed rail — no second mail path) with a
+single-use 72h approve link, and `convert` returns `pending_approval:true`
+until approved. Unknown state fails CLOSED. Bulk quick-add resolves customer
+part numbers from the alias store FIRST, then the catalog SKU map; matched
+lines are flagged `via_alias` and quote detail + PDF show the customer's part
+number alongside our SKU.
 
 Error model: 4xx with `{error}` for client mistakes; 502 with
 `{error, degraded: true}` when Axis is unreachable (drawer renders the
@@ -72,12 +90,15 @@ Error model: 4xx with `{error}` for client mistakes; 502 with
 - `preview.js` — **Wave-1** ephemeral preview tokens (separate store, 15-min TTL, purge on delete)
 - `bulk.js` — **Wave-1** paste/CSV parse + resolve (pure, unit-tested)
 - `pdf.js` — **Wave-1** PES-branded quote PDF (zero-dep writer; logo from `assets/pes-logo.b64`, text-wordmark fallback)
-- `mailer.js` — **Wave-1** lifecycle emails (created/shared/expiring/converted); rail STUBBED without `RESEND_API_KEY`
+- `mailer.js` — **Wave-1** lifecycle emails (created/shared/expiring/converted + **Wave-2B** approval_required); rail STUBBED without `RESEND_API_KEY`
+- `approval.js` — **Wave-2B (P2-12)** approval threshold state + single-use 72h approve tokens (fail-closed)
+- `aliases.js` — **Wave-2B (#109)** customer part-number alias store (customer_email + customer_sku → our_sku)
 - `order-sync.js` / `registry.js` — Stitch-2 order sync + proxy-touched-quote registry
 - `progress.js` — **P1** volume progress + public-pricelist detection (non-stacking rule)
 - `cache.js` — customer-metafield cache writer **(STUB: local JSON until Admin creds land)**
 - `sku-map.js` + `data/sku-variant-map.json` — SKU→variant mapping (boot-seeded from the public storefront feed)
 - `data/share-tokens.json`, `data/preview-tokens.json`, `data/email-outbox.json`, `data/known-quotes.json` — runtime stores; **persist across deploys** or links die
+- `data/quote-approvals.json`, `data/customer-aliases.json` — **Wave-2B** runtime stores, same container-fs persistence model: LOST on container group recreation. Losing approvals fails safe (over-threshold quotes flip back to pending); losing aliases means customers re-enter their part numbers (recreation caveat — Azure Files mount for `data/` still pending storage perms)
 - `scripts/axis-test-cycle.js` / `axis-test-p1.js` / `axis-test-w1.js` — live-Axis validation cycles (create→verify→DELETE)
 - `scripts/test-p1-units.js` / `test-w1-units.js` / `test-wave1-comms.js` — unit tests, no Axis
 
@@ -87,7 +108,9 @@ Error model: 4xx with `{error}` for client mistakes; 502 with
 node scripts/test-p1-units.js     # P1 units (16 checks, no Axis)
 node scripts/test-w1-units.js     # Wave-1 units (18 checks, no Axis)
 node scripts/test-wave1-comms.js  # Wave-1 comms units (86 checks, no Axis)
+node scripts/test-w2b-units.js    # Wave-2B units (approval gating, token lifecycle, alias order)
 node scripts/axis-test-cycle.js   # P0 live cycle
 node scripts/axis-test-p1.js      # P1 live cycle
 node scripts/axis-test-w1.js      # Wave-1 live cycle (typeahead/bulk/copy/preview/delete)
+node scripts/axis-test-w2b.js     # Wave-2B live cycle (approval gate + aliases)
 ```

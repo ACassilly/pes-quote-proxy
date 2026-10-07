@@ -294,7 +294,10 @@ function buildPages(quote, partner, mode, logo) {
   }
   for (const l of lines) {
     const titleLines = wrap(l.title || "", 9, showPrices ? 270 : 380);
-    const skuLine = l.sku ? "SKU " + l.sku : "";
+    // Wave-2B (#109): show the customer's own part number alongside our SKU.
+    const skuLine = l.sku
+      ? "SKU " + l.sku + (l.customer_sku ? " - Your part # " + l.customer_sku : "")
+      : (l.customer_sku ? "Your part # " + l.customer_sku : "");
     const rowH = Math.max(15, titleLines.length * 11 + (skuLine ? 10 : 0) + 6);
     ensure(rowH + 10);
     if (pages[pages.length - 1] !== p && y === PAGE_H - MARGIN) tableHeader();

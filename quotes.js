@@ -33,6 +33,8 @@ const bulk = require("./bulk");
 const progress = require("./progress");
 const pdf = require("./pdf");
 const registry = require("./registry");
+const approval = require("./approval");
+const aliases = require("./aliases");
 const { Mailer } = require("./mailer");
 
 const QUOTE_FOOTER =
@@ -195,6 +197,14 @@ class QuoteService {
       contractPriced,
     });
 
+    // Wave-2B (#109): the customer's own part numbers display alongside our
+    // SKUs on quote detail + PDF when aliases exist (reverse lookup).
+    const custSkuByOur = email ? aliases.reverseMapForEmail(email) : {};
+
+    // Wave-2B (P2-12): approval state. FAIL CLOSED — over-threshold quotes
+    // with no approval record report "pending" (not convertible).
+    const approvalInfo = approval.infoFor(order.id, order.amount_total, this.cfg.quoteApprovalMin);
+
     return {
       id: order.id,
       name: order.client_order_ref || order.name,
@@ -205,6 +215,7 @@ class QuoteService {
       pricelist_id: quotePricelistId,
       contract_priced: contractPriced, // true/false, null = could not determine
       volume_progress: volumeProgress,
+      approval: approvalInfo, // {required, state: none|pending|approved, threshold, ...}
       expiry: order.validity_date || null,
       expires_in_days: order.validity_date ? daysBetween(today, order.validity_date) : null,
       expired: order.validity_date ? order.validity_date < today : false,
@@ -219,6 +230,7 @@ class QuoteService {
         return {
           line_id: l.id,
           sku: skuByProd[pid] || null,
+          customer_sku: custSkuByOur[String(skuByProd[pid] || "").toUpperCase()] || null, // Wave-2B #109
           title: titleByProd[pid] || cleanName(l.name),
           qty: l.product_uom_qty,
           unit_price: l.price_unit,
@@ -309,6 +321,7 @@ class QuoteService {
     }
     share.purgeOrder(order.id);
     preview.purgeOrder(order.id);
+    approval.purgeOrder(order.id); // Wave-2B
     registry.remove(order.id);
     await this.refreshCache(email);
     return { deleted: true, mode, quote_no: order.name, id: order.id };
@@ -342,6 +355,19 @@ class QuoteService {
     }
     if (!parsed.ok.length && !parsed.failed.length) {
       throw badRequest("nothing to add — paste lines as: SKU, qty");
+    }
+
+    // Wave-2B (#109): resolve CUSTOMER part numbers FIRST (per-email alias
+    // store), then our catalog SKUs. A matched line carries the original
+    // customer token so the UI can show "matched via your part number".
+    const aliasMap = aliases.mapForEmail(email);
+    for (const l of parsed.ok) {
+      const hit = aliasMap[l.sku.toUpperCase()];
+      if (hit) {
+        l.customer_sku = l.sku;
+        l.sku = hit;
+        l.via_alias = true;
+      }
     }
 
     if (!confirm) {
@@ -392,7 +418,7 @@ class QuoteService {
         const existingId = existingLineIdByProd.get(prod.id);
         if (existingId) {
           await this.axis.write("sale.order.line", [existingId], { product_uom_qty: l.qty });
-          updated.push({ line: l.line, sku: l.sku, qty: l.qty, line_id: existingId });
+          updated.push({ line: l.line, sku: l.sku, qty: l.qty, line_id: existingId, ...(l.customer_sku ? { customer_sku: l.customer_sku, via_alias: true } : {}) });
         } else {
           const key = lineKey(email, order.id, l.sku, l.qty);
           const lineId = await this.axis.create("sale.order.line", {
@@ -403,7 +429,7 @@ class QuoteService {
             name: `${cleanName(prod.name)} [pesq:${key}]`,
           });
           existingLineIdByProd.set(prod.id, lineId);
-          added.push({ line: l.line, sku: l.sku, qty: l.qty, line_id: lineId });
+          added.push({ line: l.line, sku: l.sku, qty: l.qty, line_id: lineId, ...(l.customer_sku ? { customer_sku: l.customer_sku, via_alias: true } : {}) });
         }
       } catch (e) {
         // Fail loud per line; one bad line never sinks the batch.
@@ -570,9 +596,58 @@ class QuoteService {
    * Shopify owns price at checkout; we compare quoted vs current price and
    * flag >3% drift for the interstitial. Price DROPS never block. Freight
    * lines are flagged and excluded from price-lock language.
+   *
+   * Wave-2B (P2-12): approval threshold. When the quote total reaches
+   * QUOTE_APPROVAL_MIN the conversion is GATED: the quote enters "pending
+   * approval" (Axis flag + proxy state), the approver gets an outbox email
+   * with a single-use 72h approve link, and this endpoint returns a clear
+   * pending_approval state instead of a permalink. Unknown approval state
+   * fails CLOSED (not convertible).
    */
   async convertQuote(email, ref) {
     const quote = await this.getQuote(email, ref);
+
+    // ----- P2-12 approval gate (fail closed) -----
+    if (approval.needsApproval(quote.total, this.cfg.quoteApprovalMin)) {
+      const flagged = approval.flagPending(quote.id, quote.total);
+      if (flagged.state !== "approved") {
+        if (flagged.created) {
+          // Axis-side flag for desk visibility (tag first, note marker as
+          // fallback) — best-effort; the proxy store is authoritative.
+          this.flagAxisApproval(quote.id).catch((e) => console.warn("[approval] Axis flag failed:", e.message));
+          // Approver email via the SAME stubbed outbox rail as every other
+          // lifecycle email (no second mail path).
+          const approveUrl =
+            (this.cfg.storefrontUrl || "https://www.portlandiaelectric.supply") +
+            "/apps/quotes/approve?token=" + flagged.token;
+          this.mailer.queue(
+            "approval_required",
+            {
+              email: this.cfg.quoteApproverEmail,
+              customerEmail: email,
+              quote,
+              approveUrl,
+              threshold: this.cfg.quoteApprovalMin,
+            },
+            { to: this.cfg.quoteApproverEmail, dedupeKey: `approval:${quote.id}` }
+          ).catch((e) => console.warn("[mailer] approval_required:", e.message));
+        }
+        return {
+          pending_approval: true,
+          approval_required: true,
+          quote_no: quote.quote_no,
+          name: quote.name,
+          total: quote.total,
+          threshold: this.cfg.quoteApprovalMin,
+          approval: { state: "pending", flagged_at: flagged.flagged_at || null },
+          message:
+            "This quote is over the approval threshold and is pending approval by our team. " +
+            "Checkout unlocks as soon as it is approved — no action needed on your side.",
+          footer: QUOTE_FOOTER.replace("{expiry}", quote.expiry || ""),
+        };
+      }
+    }
+
     const items = [];
     const drift = [];
     const skipped = [];
@@ -614,9 +689,94 @@ class QuoteService {
       skipped,
       drift,
       requires_review: drift.length > 0, // >3% drift => interstitial before checkout
+      approval: approval.infoFor(quote.id, quote.total, this.cfg.quoteApprovalMin), // Wave-2B
       footer: QUOTE_FOOTER.replace("{expiry}", quote.expiry || ""),
     };
   }
+
+  /* ---------- Wave-2B: quote approval (P2-12) ---------- */
+
+  /**
+   * Axis-side pending flag for desk visibility. Best-effort: the proxy
+   * approval store is authoritative; Axis only mirrors the state so a human
+   * looking at the sale.order sees it. Tag first (sale.order.tag
+   * search-or-create), note-marker fallback if the tag model/field refuses.
+   */
+  async flagAxisApproval(orderId) {
+    const TAG = "PES Approval Pending";
+    try {
+      let tagId = (await this.axis.search("sale.order.tag", [["name", "=", TAG]], { limit: 1 }))[0] || null;
+      if (!tagId) tagId = await this.axis.create("sale.order.tag", { name: TAG });
+      await this.axis.write("sale.order", [orderId], { tag_ids: [[4, tagId]] });
+    } catch (e) {
+      console.warn("[approval] tag path failed, using note marker:", e.message);
+      const rows = await this.axis.read("sale.order", [orderId], ["note"]);
+      const cur = String((rows[0] && rows[0].note) || "");
+      if (!cur.includes("[PES-APPROVAL-PENDING]")) {
+        await this.axis.write("sale.order", [orderId], { note: (cur ? cur + " " : "") + "[PES-APPROVAL-PENDING]" });
+      }
+    }
+  }
+
+  /** Remove the pending flag after approval (best-effort mirror of the store). */
+  async unflagAxisApproval(orderId) {
+    const TAG = "PES Approval Pending";
+    // Independent guards: sale.order.tag does not exist on every Odoo 19 DB,
+    // so a tag failure must never skip the note-marker cleanup.
+    try {
+      const tagId = (await this.axis.search("sale.order.tag", [["name", "=", TAG]], { limit: 1 }))[0] || null;
+      if (tagId) await this.axis.write("sale.order", [orderId], { tag_ids: [[3, tagId]] });
+    } catch (e) {
+      console.warn("[approval] tag unflag skipped:", e.message);
+    }
+    try {
+      const rows = await this.axis.read("sale.order", [orderId], ["note"]);
+      const cur = String((rows[0] && rows[0].note) || "");
+      if (cur.includes("[PES-APPROVAL-PENDING]")) {
+        await this.axis.write("sale.order", [orderId], { note: cur.replace(/\s*\[PES-APPROVAL-PENDING\]/g, "") });
+      }
+    } catch (e) {
+      console.warn("[approval] note unflag skipped:", e.message);
+    }
+  }
+
+  /**
+   * Approve a quote via a single-use 72h token from the approver email.
+   * The token is the capability (no session); failures never mutate state.
+   */
+  async approveQuoteByToken(token) {
+    const { order_id } = approval.approveToken(token); // throws 400/404/409/410
+    // Awaited so the Axis mirror is accurate when the confirmation renders;
+    // errors are logged, never thrown (proxy store stays authoritative).
+    await this.unflagAxisApproval(order_id);
+    let quoteNo = null;
+    try {
+      const rows = await this.axis.read("sale.order", [order_id], ["name"]);
+      quoteNo = rows[0] ? rows[0].name : null;
+    } catch { /* quote number is cosmetic on the confirmation page */ }
+    return { approved: true, order_id, quote_no: quoteNo };
+  }
+
+  /* ---------- Wave-2B: customer part-number aliases (#109) ---------- */
+
+  async listAliases(email) {
+    return { aliases: aliases.listForEmail(email) };
+  }
+
+  async addAlias(email, customerSku, ourSku) {
+    // Validate our SKU against the catalog map (same source the bulk preview
+    // resolves against) so an alias can never point at a dead SKU.
+    if (!skuMap.lookup(ourSku)) {
+      throw badRequest(`our SKU not found in the catalog: ${ourSku}`);
+    }
+    const row = aliases.addAlias(email, customerSku, ourSku);
+    return { saved: true, alias: row };
+  }
+
+  async removeAlias(email, customerSku) {
+    return { removed: aliases.removeAlias(email, customerSku) };
+  }
+
 
   /* ---------- Wave-1: branded quote PDF (P2-3) ---------- */
 

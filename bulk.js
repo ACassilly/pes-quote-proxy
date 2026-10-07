@@ -154,6 +154,8 @@ function resolveBulk(parsed, lookup) {
       title: m.title || null,
       shopify_price: Number.isFinite(Number(m.shopify_price)) ? Number(m.shopify_price) : null,
       freight: !!m.freight,
+      // Wave-2B (#109): present when the line matched via a customer alias.
+      ...(l.customer_sku ? { customer_sku: l.customer_sku, via_alias: true } : {}),
     });
   }
   return { resolved, failed };

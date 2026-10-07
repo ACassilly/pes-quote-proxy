@@ -136,6 +136,9 @@ function maskQuote(quote, mode) {
   const baseLines = (quote.lines || []).map((l) => ({
     title: l.title,
     sku: l.sku,
+    // NOTE: customer_sku (Wave-2B #109) is deliberately NOT carried into the
+    // "none" base shape — mode=none payloads are pinned to exactly
+    // {title, sku, qty} per line (masking invariant, unit-tested).
     qty: l.qty,
   }));
 
@@ -145,6 +148,7 @@ function maskQuote(quote, mode) {
     lines = (quote.lines || []).map((l) => ({
       title: l.title,
       sku: l.sku,
+      customer_sku: l.customer_sku || null,
       qty: l.qty,
       unit_price: l.unit_price,
       line_total: l.line_total,
@@ -164,6 +168,7 @@ function maskQuote(quote, mode) {
       return {
         title: l.title,
         sku: l.sku,
+        customer_sku: l.customer_sku || null,
         qty: l.qty,
         unit_price: retail,
         line_total: round2(retail * l.qty),

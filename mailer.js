@@ -201,6 +201,31 @@ function compose(event, ctx) {
     };
   }
 
+  if (event === "approval_required") {
+    // Wave-2B (P2-12): to the APPROVER (env QUOTE_APPROVER_EMAIL), not the
+    // quote owner. Carries the quote summary + a single-use 72h approve link.
+    const approveUrl = ctx.approveUrl || quoteUrl;
+    const customer = ctx.customerEmail || "the customer";
+    const title = `Quote ${q.quote_no} needs approval`;
+    return {
+      subject: `Approval needed: quote ${q.quote_no} (${q.name}) — estimated total ${money(q.total)}`,
+      html: shell({
+        title,
+        preheader: `Quote ${q.quote_no} from ${customer} is over the approval threshold and waiting on your sign-off.`,
+        bodyHtml:
+          para(`<strong>${name}</strong> (${esc(q.quote_no)}), requested by <strong>${esc(customer)}</strong>, has an estimated total of <strong>${money(q.total)}</strong>` +
+            (ctx.threshold ? ` — at or over the <strong>${money(ctx.threshold)}</strong> approval threshold` : "") +
+            `. Checkout is locked until this quote is approved.`) +
+          infoBox(`<strong>${esc(q.quote_no)}</strong> &middot; ${name} &middot; ${(q.lines || []).length} line item${(q.lines || []).length === 1 ? "" : "s"} &middot; estimated total <strong>${money(q.total)}</strong><br>` +
+            `Customer: ${esc(customer)}${q.expiry ? ` &middot; prices held until ${esc(expiry)}` : ""}`) +
+          para(`Approving takes one click and immediately unlocks checkout for the customer. The link below works exactly once and expires in 72 hours — if it lapses, a fresh approval request is generated the next time the customer tries to check out.`),
+        cta: { url: approveUrl, label: "Approve this quote", sub: "Single-use link — valid for 72 hours." },
+        footerNote: `Prices held until ${expiry} on eligible items. Availability confirmed at order time.`,
+      }),
+      text: `Quote ${q.quote_no} (${q.name}) from ${customer} needs approval. Estimated total ${money(q.total)}. Approve (single-use, 72h): ${approveUrl}`,
+    };
+  }
+
   throw new Error(`unknown email event: ${event}`);
 }
 
