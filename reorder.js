@@ -534,8 +534,8 @@ class ReorderService {
           sku: li.sku ? String(li.sku) : null,
           qty: li.quantity,
           unit_price: Number(li.price),
-          title: li.variant_title && li.variant_title !== "Default Title"
-            ? `${li.title} — ${li.variant_title}`
+          title: li.variant_title && li.variantTitle !== "Default Title"
+            ? `${li.title} — ${li.variantTitle}`
             : li.title,
         }));
         if (!lines.length) throw badRequest(`order ${order.name} has no lines to reorder`);
