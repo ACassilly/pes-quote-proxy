@@ -1,0 +1,13 @@
+{
+	# Let's Encrypt's duplicate-certificate limit (5 per exact identifier set
+	# per 168h) was exhausted 2026-10-07 by repeated container-group recreations
+	# (the caddy-data volume is emptyDir, so every recreation re-issues).
+	# Buypass Go SSL is a free ACME CA with an independent rate-limit pool and
+	# needs no EAB credentials, so TLS automation survives recreations.
+	acme_ca https://api.buypass.com/acme/directory
+	email sales@portlandiaelectric.supply
+}
+
+pes-quote-proxy.eastus.azurecontainer.io
+
+reverse_proxy localhost:8787
