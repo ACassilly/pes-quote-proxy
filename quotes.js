@@ -28,7 +28,12 @@ const crypto = require("crypto");
 const cache = require("./cache");
 const skuMap = require("./sku-map");
 const share = require("./share");
+const preview = require("./preview");
+const bulk = require("./bulk");
 const progress = require("./progress");
+const pdf = require("./pdf");
+const registry = require("./registry");
+const { Mailer } = require("./mailer");
 
 const QUOTE_FOOTER =
   "Prices held until {expiry} on eligible items. Availability confirmed at order time.";
@@ -51,6 +56,13 @@ class QuoteService {
   constructor(axis, config) {
     this.axis = axis;
     this.cfg = config;
+    // Quote lifecycle emails (Wave-1). Composes + queues always; SENDS only
+    // when RESEND_API_KEY is set — otherwise the rail is stubbed (outbox only).
+    this.mailer = new Mailer({
+      resendApiKey: config.resendApiKey,
+      mailFrom: config.mailFrom,
+      storefrontUrl: config.storefrontUrl,
+    });
   }
 
   /* ---------- partner ---------- */
@@ -117,6 +129,12 @@ class QuoteService {
 
     const detail = await this.getQuote(email, orderId, { skipPartnerCheck: true });
     await this.refreshCache(email);
+    registry.record({ orderId, email, quoteNo: detail.quote_no, name: detail.name, validityDate: detail.expiry });
+    if (!reused) {
+      // Wave-1 lifecycle email: created (to quote owner). Fire-and-forget —
+      // mail failures never break quote creation.
+      this.mailer.queue("created", { email, quote: detail }).catch((e) => console.warn("[mailer] created:", e.message));
+    }
     return { reused, quote: detail, first_line: lineResult };
   }
 
@@ -290,8 +308,203 @@ class QuoteService {
       mode = "cancelled";
     }
     share.purgeOrder(order.id);
+    preview.purgeOrder(order.id);
+    registry.remove(order.id);
     await this.refreshCache(email);
     return { deleted: true, mode, quote_no: order.name, id: order.id };
+  }
+
+  /* ---------- Wave-1: bulk paste/CSV quick-add (P2-10 BEAT) ---------- */
+
+  /**
+   * Bulk line add. Two phases behind ONE endpoint:
+   *   confirm falsy  => PREVIEW: parse + resolve against the SKU map, zero
+   *                     writes; every failed line listed with a reason.
+   *   confirm true   => COMMIT: re-parse server-side (client resolution is
+   *                     never trusted), batch-resolve against Axis (authoritative),
+   *                     add/update all resolvable lines, restate validity +7d.
+   *
+   * Idempotent (spec §3.2 discipline): a line whose product is already on the
+   * quote is updated in place to the pasted qty, never duplicated — retrying
+   * the same paste is safe.
+   */
+  async bulkAddLines(email, ref, { text, lines, confirm = false } = {}) {
+    const order = await this.findQuote(email, ref);
+    if (order.state !== "draft") throw badRequest(`quote ${order.name} is ${order.state}; only draft quotes are editable`);
+
+    let parsed;
+    if (typeof text === "string") {
+      parsed = bulk.parseBulkLines(text);
+    } else if (Array.isArray(lines)) {
+      parsed = bulk.parseStructuredLines(lines);
+    } else {
+      throw badRequest("provide text (pasted lines) or lines[] (structured)");
+    }
+    if (!parsed.ok.length && !parsed.failed.length) {
+      throw badRequest("nothing to add — paste lines as: SKU, qty");
+    }
+
+    if (!confirm) {
+      // Preview only: resolve against the 24k-entry SKU map (fast, local).
+      const { resolved, failed } = bulk.resolveBulk(parsed, (sku) => skuMap.lookup(sku));
+      return {
+        confirm: false,
+        resolved,
+        failed,
+        resolved_count: resolved.length,
+        failed_count: failed.length,
+        truncated: parsed.truncated,
+      };
+    }
+
+    // Commit: Axis is authoritative. Batch-resolve SKUs -> product ids.
+    const skus = parsed.ok.map((l) => l.sku);
+    const prods = skus.length
+      ? await this.axis.searchRead(
+          "product.product",
+          [["default_code", "in", skus]],
+          ["id", "default_code", "name"],
+          { limit: skus.length + 10 }
+        )
+      : [];
+    const prodBySku = new Map(prods.map((p) => [String(p.default_code).toUpperCase(), p]));
+
+    // Existing lines, resolved once (update-in-place instead of duplicates).
+    const existingLineIdByProd = new Map();
+    if (order.order_line.length) {
+      const cur = await this.axis.read("sale.order.line", order.order_line, ["id", "product_id"]);
+      for (const l of cur) {
+        const pid = l.product_id && l.product_id[0];
+        if (pid) existingLineIdByProd.set(pid, l.id);
+      }
+    }
+
+    const added = [];
+    const updated = [];
+    const failed = parsed.failed.slice();
+    for (const l of parsed.ok) {
+      const prod = prodBySku.get(l.sku.toUpperCase());
+      if (!prod) {
+        failed.push({ line: l.line, raw: `${l.sku}, ${l.qty}`, sku: l.sku, reason: "SKU not found in the catalog" });
+        continue;
+      }
+      try {
+        const existingId = existingLineIdByProd.get(prod.id);
+        if (existingId) {
+          await this.axis.write("sale.order.line", [existingId], { product_uom_qty: l.qty });
+          updated.push({ line: l.line, sku: l.sku, qty: l.qty, line_id: existingId });
+        } else {
+          const key = lineKey(email, order.id, l.sku, l.qty);
+          const lineId = await this.axis.create("sale.order.line", {
+            order_id: order.id,
+            product_id: prod.id,
+            product_uom_qty: l.qty,
+            // price_unit intentionally omitted: Axis pricelist owns price at quote time.
+            name: `${cleanName(prod.name)} [pesq:${key}]`,
+          });
+          existingLineIdByProd.set(prod.id, lineId);
+          added.push({ line: l.line, sku: l.sku, qty: l.qty, line_id: lineId });
+        }
+      } catch (e) {
+        // Fail loud per line; one bad line never sinks the batch.
+        failed.push({ line: l.line, raw: `${l.sku}, ${l.qty}`, sku: l.sku, reason: `Axis write failed: ${String(e.message).slice(0, 120)}` });
+      }
+    }
+
+    if (added.length || updated.length) {
+      // Lowe's behavior: any line edit re-states validity to today + 7 days.
+      await this.axis.write("sale.order", [order.id], { validity_date: todayPlus(this.cfg.quoteValidityDays) });
+    }
+    const detail = await this.getQuote(email, order.id, { skipPartnerCheck: true });
+    await this.refreshCache(email);
+    return {
+      confirm: true,
+      added_count: added.length,
+      updated_count: updated.length,
+      failed_count: failed.length,
+      added,
+      updated,
+      failed,
+      quote: detail,
+    };
+  }
+
+  /* ---------- Wave-1: Make a Copy (D3 family / Lowe's pass-2) ---------- */
+
+  /**
+   * Copy a quote: new quote #, fresh 7-day validity, carries ALL lines, the
+   * PO/Job name (client_order_ref, as "<name> (Copy)") AND the notes —
+   * Lowe's silently drops Notes on Make a Copy; we don't.
+   * Pricelist carries too, so contract pricing on the source quote carries.
+   * Idempotent: a copy with the same "(Copy)" name still in draft is reused
+   * (double-click safe), same pattern as createQuote.
+   */
+  async copyQuote(email, ref) {
+    const order = await this.findQuote(email, ref);
+    const srcName = order.client_order_ref || order.name;
+    const copyName = `${srcName} (Copy)`.slice(0, 120);
+    const partnerId = await this.findPartnerId(email);
+    if (!partnerId) throw notFound("no Axis partner for this email");
+
+    const existing = await this.axis.search(
+      "sale.order",
+      [
+        ["partner_id", "=", partnerId],
+        ["client_order_ref", "=", copyName],
+        ["state", "=", "draft"],
+      ],
+      { limit: 1 }
+    );
+    if (existing.length) {
+      const detail = await this.getQuote(email, existing[0], { skipPartnerCheck: true });
+      return { reused: true, copied_from: order.name, quote: detail };
+    }
+
+    const vals = {
+      partner_id: partnerId,
+      client_order_ref: copyName,
+      validity_date: todayPlus(this.cfg.quoteValidityDays), // fresh 7-day hold
+    };
+    const pricelistId = Array.isArray(order.pricelist_id) ? order.pricelist_id[0] : null;
+    if (pricelistId) vals.pricelist_id = pricelistId; // contract pricing carries
+    if (order.note) vals.note = order.note; // notes carry (Lowe's drops these)
+    const newId = await this.axis.create("sale.order", vals);
+
+    if (order.order_line.length) {
+      const srcLines = await this.axis.read("sale.order.line", order.order_line, ["product_id", "product_uom_qty", "name"]);
+      for (const l of srcLines) {
+        const pid = l.product_id && l.product_id[0];
+        if (!pid) continue;
+        const key = lineKey(email, newId, `copy-${pid}`, l.product_uom_qty);
+        const baseName = String(l.name || "").replace(/\s*\[pesq:[^\]]*\]\s*$/, "");
+        await this.axis.create("sale.order.line", {
+          order_id: newId,
+          product_id: pid,
+          product_uom_qty: l.product_uom_qty,
+          // price_unit intentionally omitted: the carried pricelist reprices.
+          name: `${baseName} [pesq:${key}]`,
+        });
+      }
+    }
+
+    await this.refreshCache(email);
+    const detail = await this.getQuote(email, newId, { skipPartnerCheck: true });
+    return { reused: false, copied_from: order.name, quote: detail };
+  }
+
+  /* ---------- Wave-1: Preview as client (P2-9 BEAT) ---------- */
+
+  /**
+   * Create an ephemeral (15-min) preview token for the recipient view.
+   * Never touches the real share-token store: creating a preview cannot
+   * revoke or pollute live share links.
+   */
+  async previewQuote(email, ref, { mode, note } = {}) {
+    const order = await this.findQuote(email, ref);
+    if (!["draft", "sent"].includes(order.state)) {
+      throw badRequest(`quote ${order.name} is ${order.state}; only active quotes can be previewed`);
+    }
+    return preview.createPreview({ orderId: order.id, quoteNo: order.name, mode, note });
   }
 
   /* ---------- share with price masking (P1) ---------- */
@@ -306,7 +519,12 @@ class QuoteService {
     if (!["draft", "sent"].includes(order.state)) {
       throw badRequest(`quote ${order.name} is ${order.state}; only active quotes can be shared`);
     }
-    return share.createShare({ orderId: order.id, quoteNo: order.name, mode, note });
+    const out = share.createShare({ orderId: order.id, quoteNo: order.name, mode, note });
+    // Wave-1 lifecycle email: shared (to owner, incl. masking mode + link).
+    this.getQuote(email, order.id, { skipPartnerCheck: true })
+      .then((detail) => this.mailer.queue("shared", { email, quote: detail, share: { mode, share_path: out.share_path } }))
+      .catch((e) => console.warn("[mailer] shared:", e.message));
+    return out;
   }
 
   async revokeShare(email, ref, { token } = {}) {
@@ -319,14 +537,31 @@ class QuoteService {
    * is the capability (contractor forwards the link to their client).
    * The payload is masked per the stored mode; in mode "none" no price field
    * exists anywhere in the response.
+   *
+   * Wave-1: real share tokens are checked FIRST; on a miss, ephemeral
+   * 15-minute preview tokens (P2-9 "Preview as client") resolve through the
+   * exact same masked recipient view, flagged with preview:true so the theme
+   * shows a preview banner. Preview tokens never appear in the share store.
    */
   async getSharedQuote(token) {
     const rec = share.lookupToken(token);
-    if (!rec) throw notFound("shared quote not found or link revoked");
-    const detail = await this.getQuote(null, rec.order_id, { skipPartnerCheck: true });
-    const masked = share.maskQuote(detail, rec.mode);
-    masked.note = rec.note || null;
-    masked.shared_at = rec.created_at;
+    if (rec) {
+      const detail = await this.getQuote(null, rec.order_id, { skipPartnerCheck: true });
+      const masked = share.maskQuote(detail, rec.mode);
+      masked.note = rec.note || null;
+      masked.shared_at = rec.created_at;
+      masked.preview = false;
+      return masked;
+    }
+    const pv = preview.lookupPreview(token);
+    if (pv === "expired") throw notFound("preview link expired (previews last 15 minutes) — open a fresh preview from the quote");
+    if (!pv) throw notFound("shared quote not found or link revoked");
+    const detail = await this.getQuote(null, pv.order_id, { skipPartnerCheck: true });
+    const masked = share.maskQuote(detail, pv.mode);
+    masked.note = pv.note || null;
+    masked.shared_at = pv.created_at;
+    masked.preview = true;
+    masked.preview_expires_at = pv.expires_at;
     return masked;
   }
 
@@ -363,6 +598,13 @@ class QuoteService {
     }
     if (!items.length) throw badRequest("no quotable lines could be mapped to Shopify variants");
     const permalink = "/cart/" + items.map((i) => `${i.variant_id}:${i.qty}`).join(",");
+    // Wave-1 lifecycle email: converted (to owner). The cart URL is relative
+    // to the storefront; the mailer prefixes it.
+    this.mailer.queue("converted", {
+      email,
+      quote,
+      cartUrl: (this.cfg.storefrontUrl || "https://www.portlandiaelectric.supply") + permalink,
+    }).catch((e) => console.warn("[mailer] converted:", e.message));
     return {
       quote_no: quote.quote_no,
       name: quote.name,
@@ -374,6 +616,118 @@ class QuoteService {
       requires_review: drift.length > 0, // >3% drift => interstitial before checkout
       footer: QUOTE_FOOTER.replace("{expiry}", quote.expiry || ""),
     };
+  }
+
+  /* ---------- Wave-1: branded quote PDF (P2-3) ---------- */
+
+  /** Partner contact block for the PDF header. Never fails the PDF. */
+  async readPartnerForPdf(partnerId) {
+    try {
+      const rows = await this.axis.read("res.partner", [partnerId], [
+        "name", "email", "phone", "street", "street2", "city", "state_id", "zip", "country_id",
+      ]);
+      if (!rows.length) return {};
+      const p = rows[0];
+      const addrParts = [
+        [p.street, p.street2].filter(Boolean).join(", "),
+        [p.city, Array.isArray(p.state_id) ? p.state_id[1] : null, p.zip].filter(Boolean).join(" "),
+        Array.isArray(p.country_id) ? p.country_id[1] : null,
+      ].filter(Boolean);
+      return {
+        name: p.name || null,
+        email: p.email || null,
+        phone: p.phone || null,
+        address: addrParts.join(", ") || null,
+      };
+    } catch (e) {
+      console.warn("[pdf] partner read failed (rendering without contact block):", e.message);
+      return {};
+    }
+  }
+
+  /**
+   * Owner PDF download: full pricing. `?mode=` is accepted for parity with
+   * the Lowe's Download dialog (full | price_only | none) — the owner may
+   * deliberately download a masked copy to hand to a client.
+   */
+  async getQuotePdf(email, ref, { mode = "full" } = {}) {
+    if (!["full", "price_only", "none"].includes(mode)) throw badRequest("mode must be full | price_only | none");
+    const order = await this.findQuote(email, ref);
+    const detail = await this.getQuote(email, order.id, { skipPartnerCheck: true });
+    detail.created = order.create_date || null;
+    const partner = Array.isArray(order.partner_id)
+      ? await this.readPartnerForPdf(order.partner_id[0])
+      : {};
+    const buffer = pdf.renderQuotePdf({ quote: detail, partner, mode });
+    return { buffer, filename: `PES-Quote-${detail.quote_no}.pdf`, mode };
+  }
+
+  /**
+   * Shared-link PDF: masked per the token's stored mode. A "none" share
+   * produces a PDF with NO prices and NO totals anywhere. Preview tokens
+   * (P2-9) resolve here too, with the same masking.
+   */
+  async getSharedQuotePdf(token) {
+    let rec = share.lookupToken(token);
+    if (!rec) {
+      const pv = preview.lookupPreview(token);
+      if (pv === "expired") throw notFound("preview link expired (previews last 15 minutes) — open a fresh preview from the quote");
+      if (!pv) throw notFound("shared quote not found or link revoked");
+      rec = pv;
+    }
+    const order = await this.findQuote(null, rec.order_id, { skipPartnerCheck: true });
+    const detail = await this.getQuote(null, rec.order_id, { skipPartnerCheck: true });
+    detail.created = order.create_date || null;
+    const partner = Array.isArray(order.partner_id)
+      ? await this.readPartnerForPdf(order.partner_id[0])
+      : {};
+    const buffer = pdf.renderQuotePdf({ quote: detail, partner, mode: rec.mode });
+    return { buffer, filename: `PES-Quote-${detail.quote_no}.pdf`, mode: rec.mode };
+  }
+
+  /* ---------- Wave-1: day-5-of-7 expiring-quote email sweep ---------- */
+
+  /**
+   * Expiring sweep: emails quote owners whose proxy-touched quote expires in
+   * exactly 2 days (day 5 of the 7-day hold). GUARDRAIL: only quotes in the
+   * local registry (created/touched by this proxy) are considered — Axis
+   * holds ~2,800 historical drafts belonging to real customers who must
+   * never receive these. Deduped per (order, validity_date) so re-runs and
+   * restarts never double-send; an edit that restates validity produces a
+   * new dedupe key (correct: a fresh 7-day hold gets a fresh day-5 email).
+   * Returns a summary; never throws.
+   */
+  async sweepExpiringQuotes() {
+    const target = todayPlus(2); // day 5 of 7
+    const out = { target_date: target, candidates: 0, emailed: 0, deduped: 0, skipped: 0, errors: 0 };
+    for (const entry of registry.all()) {
+      out.candidates++;
+      try {
+        const rows = await this.axis.searchRead(
+          "sale.order",
+          [["id", "=", entry.order_id], ["state", "in", ["draft", "sent"]]],
+          ["id", "name", "validity_date"],
+          { limit: 1 }
+        );
+        if (!rows.length || rows[0].validity_date !== target) {
+          out.skipped++;
+          continue;
+        }
+        const detail = await this.getQuote(null, entry.order_id, { skipPartnerCheck: true });
+        const res = await this.mailer.queue(
+          "expiring",
+          { email: entry.email, quote: detail },
+          { dedupeKey: `expiring:${entry.order_id}:${target}` }
+        );
+        if (res.status === "deduped") out.deduped++;
+        else out.emailed++;
+      } catch (e) {
+        out.errors++;
+        console.warn(`[sweep] order ${entry.order_id}:`, e.message);
+      }
+    }
+    console.log("[sweep] expiring sweep:", JSON.stringify(out));
+    return out;
   }
 
   /* ---------- cache ---------- */
@@ -406,7 +760,7 @@ class QuoteService {
     const orders = await this.axis.searchRead(
       "sale.order",
       domain,
-      ["id", "name", "client_order_ref", "state", "validity_date", "amount_total", "amount_untaxed", "write_date", "order_line", "pricelist_id"],
+      ["id", "name", "client_order_ref", "state", "validity_date", "amount_total", "amount_untaxed", "write_date", "order_line", "pricelist_id", "note", "create_date", "partner_id"],
       { limit: 1 }
     );
     if (!orders.length) throw notFound(`quote not found: ${ref}`);
