@@ -6,14 +6,18 @@
  * link), expiring (day 5 of 7, to owner, convert CTA), converted (to owner).
  *
  * MAIL RAIL — READ THIS FIRST:
- *   The sender is STUBBED unless RESEND_API_KEY is set in the environment.
- *   That single env var is the only switch: with it, messages are sent via
- *   the Resend API (POST https://api.resend.com/emails); without it, every
+ *   Rail priority: (1) Microsoft Graph sendMail when GRAPH_TENANT_ID /
+ *   GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET are set (app-only client
+ *   credentials; wired as ACI secure env vars from KV kv-riven-ops-eus
+ *   RIVEN-CONNECTOR-GRAPH-* — see graph-mail.js; LIVE since 2026-10-08,
+ *   Mail.Send proven with a real probe email confirmed in the mailbox);
+ *   (2) Resend when RESEND_API_KEY is set; (3) otherwise STUBBED — every
  *   message is composed fully and appended to data/email-outbox.json with
- *   status "stubbed-no-rail" and a loud log line. NOTHING leaves the box.
- *   As of the Wave-1 build (2026-10-07) no mail credential exists in Azure
- *   Key Vault (kv-riven-ops-eus secret inventory checked) or the container
- *   environment, so the rail is STUBBED in production.
+ *   status "stubbed-no-rail". To return to the stub: unset the GRAPH_* envs.
+ *
+ *   On boot with a live rail, drainOutbox() re-sends rows previously stubbed
+ *   or send-errored (send or keep, NEVER drop — failures stay in the file
+ *   with a drain_error note).
  *
  * Sender identity: sales@portlandiaelectric.supply — consistent with the
  * support mailbox used in the three live order-notification templates
@@ -29,6 +33,7 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const { createGraphSender } = require("./graph-mail");
 
 const OUTBOX_PATH = path.join(__dirname, "data", "email-outbox.json");
 const ACCENT = "#1d6b3f";
@@ -296,17 +301,79 @@ class Mailer {
     this.from = this.cfg.mailFrom || "PES Supply <sales@portlandiaelectric.supply>";
     this.storefrontUrl = this.cfg.storefrontUrl || "https://www.portlandiaelectric.supply";
     this.apiKey = this.cfg.resendApiKey || null;
-    if (!this.apiKey) {
+    // Rail priority: Graph (env GRAPH_*) > Resend (RESEND_API_KEY) > stub.
+    // cfg._senderForTest injects a fake sender for unit tests (never in prod).
+    this.graphSender = this.cfg._senderForTest !== undefined
+      ? this.cfg._senderForTest
+      : createGraphSender();
+    if (this.graphSender) {
+      console.log(`[mailer] rail LIVE via Microsoft Graph (mailbox ${this.graphSender.mailbox}, from ${this.graphSender.fromAddress})`);
+      // Drain anything queued while the rail was stubbed. Fire-and-forget;
+      // failures are recorded per-row, never thrown, never dropped.
+      // (_noAutoDrain exists for unit tests — never set it in production.)
+      if (!this.cfg._noAutoDrain) {
+        setImmediate(() => this.drainOutbox().catch((e) => console.error("[mailer] drain failed:", e.message)));
+      }
+    } else if (!this.apiKey) {
       console.warn(
-        "[mailer] *** MAIL RAIL STUBBED — RESEND_API_KEY is not set. " +
+        "[mailer] *** MAIL RAIL STUBBED — neither GRAPH_* nor RESEND_API_KEY is set. " +
         "Quote lifecycle emails are composed and queued to data/email-outbox.json but NOTHING is sent. " +
-        "Set RESEND_API_KEY (and optionally MAIL_FROM) to turn the rail on. ***"
+        "Set GRAPH_TENANT_ID/GRAPH_CLIENT_ID/GRAPH_CLIENT_SECRET (or RESEND_API_KEY) to turn the rail on. ***"
       );
     }
   }
 
   railStatus() {
-    return this.apiKey ? "resend" : "stubbed-no-rail";
+    return this.graphSender ? "graph" : this.apiKey ? "resend" : "stubbed-no-rail";
+  }
+
+  /** Low-level send through whichever rail is live. Throws on failure. */
+  async deliver({ to, subject, html, text }) {
+    if (this.graphSender) {
+      await this.graphSender.send({ to, subject, html, text });
+      return { id: null, rail: "graph" }; // Graph sendMail returns no id
+    }
+    const res = await postResend(this.apiKey, {
+      from: this.from,
+      to: Array.isArray(to) ? to : [to],
+      subject,
+      html,
+      text,
+    });
+    return { id: res && res.id ? res.id : null, rail: "resend" };
+  }
+
+  /**
+   * Drain rows queued while the rail was stubbed (or failed): re-send each
+   * through the live rail. Send or keep — rows are NEVER dropped; a failed
+   * row stays in the file with drain_error. Returns a summary. Never throws.
+   */
+  async drainOutbox() {
+    const rows = loadOutbox();
+    const pending = rows.filter(
+      (r) => (r.status === "stubbed-no-rail" || r.status === "send-error") && r.to && r.subject && (r.html || r.text)
+    );
+    const out = { pending: pending.length, sent: 0, kept: 0 };
+    if (!pending.length) return out;
+    let dirty = false;
+    for (const row of pending) {
+      try {
+        await this.deliver({ to: row.to, subject: row.subject, html: row.html, text: row.text });
+        row.status = "sent";
+        row.drained_at = new Date().toISOString();
+        delete row.error;
+        out.sent++;
+        console.log(`[mailer] drained ${row.event} to ${row.to}: "${row.subject}"`);
+      } catch (e) {
+        row.drain_error = e.message;
+        out.kept++;
+        console.error(`[mailer] drain kept row (${row.event} to ${row.to}):`, e.message);
+      }
+      dirty = true;
+    }
+    if (dirty) saveOutbox(rows);
+    console.log(`[mailer] outbox drain: ${JSON.stringify(out)}`);
+    return out;
   }
 
   /**
@@ -340,23 +407,23 @@ class Mailer {
       if (dup) return { status: "deduped" };
     }
 
-    if (!this.apiKey) {
+    if (!this.graphSender && !this.apiKey) {
       row.status = "stubbed-no-rail";
       appendOutbox(row);
-      console.log(`[mailer] STUBBED (no RESEND_API_KEY) — queued ${event} to ${recipient}: "${msg.subject}"`);
+      console.log(`[mailer] STUBBED (no GRAPH_*/RESEND_API_KEY) — queued ${event} to ${recipient}: "${msg.subject}"`);
       return { status: "stubbed-no-rail" };
     }
 
     try {
-      const res = await postResend(this.apiKey, {
-        from: this.from,
-        to: [recipient],
+      const res = await this.deliver({
+        to: recipient,
         subject: msg.subject,
         html: msg.html,
         text: msg.text,
       });
       row.status = "sent";
-      row.provider_id = res && res.id ? res.id : null;
+      row.rail = res.rail;
+      row.provider_id = res.id;
       appendOutbox(row);
       console.log(`[mailer] sent ${event} to ${recipient} (id ${row.provider_id})`);
       return { status: "sent", id: row.provider_id };
