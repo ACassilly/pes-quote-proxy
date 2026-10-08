@@ -36,6 +36,7 @@ const registry = require("./registry");
 const approval = require("./approval");
 const aliases = require("./aliases");
 const { Mailer } = require("./mailer");
+const { IntercomFlag } = require("./intercom");
 
 const QUOTE_FOOTER =
   "Prices held until {expiry} on eligible items. Availability confirmed at order time.";
@@ -64,6 +65,12 @@ class QuoteService {
       resendApiKey: config.resendApiKey,
       mailFrom: config.mailFrom,
       storefrontUrl: config.storefrontUrl,
+    });
+    // Wave-2B staff-flag rail (owner ruling 2026-10-08). STUBBED until
+    // INTERCOM_TOKEN is set — composes to data/intercom-outbox.json.
+    this.intercom = new IntercomFlag({
+      intercomToken: config.intercomToken,
+      intercomAdminId: config.intercomAdminId,
     });
   }
 
@@ -201,9 +208,10 @@ class QuoteService {
     // SKUs on quote detail + PDF when aliases exist (reverse lookup).
     const custSkuByOur = email ? aliases.reverseMapForEmail(email) : {};
 
-    // Wave-2B (P2-12): approval state. FAIL CLOSED — over-threshold quotes
-    // with no approval record report "pending" (not convertible).
-    const approvalInfo = approval.infoFor(order.id, order.amount_total, this.cfg.quoteApprovalMin);
+    // Wave-2B (P2-12, owner ruling 2026-10-08): FLAG state — over-threshold
+    // quotes are flagged for staff attention but NEVER blocked. `flag` =
+    // {required, flagged, flagged_at, threshold}.
+    const flagInfo = approval.infoFor(order.id, order.amount_total, this.cfg.quoteFlagMin);
 
     return {
       id: order.id,
@@ -215,7 +223,7 @@ class QuoteService {
       pricelist_id: quotePricelistId,
       contract_priced: contractPriced, // true/false, null = could not determine
       volume_progress: volumeProgress,
-      approval: approvalInfo, // {required, state: none|pending|approved, threshold, ...}
+      flag: flagInfo, // Wave-2B — informational only, never gates conversion
       expiry: order.validity_date || null,
       expires_in_days: order.validity_date ? daysBetween(today, order.validity_date) : null,
       expired: order.validity_date ? order.validity_date < today : false,
@@ -597,54 +605,39 @@ class QuoteService {
    * flag >3% drift for the interstitial. Price DROPS never block. Freight
    * lines are flagged and excluded from price-lock language.
    *
-   * Wave-2B (P2-12): approval threshold. When the quote total reaches
-   * QUOTE_APPROVAL_MIN the conversion is GATED: the quote enters "pending
-   * approval" (Axis flag + proxy state), the approver gets an outbox email
-   * with a single-use 72h approve link, and this endpoint returns a clear
-   * pending_approval state instead of a permalink. Unknown approval state
-   * fails CLOSED (not convertible).
+   * Wave-2B (P2-12, owner ruling 2026-10-08): FLAG, never block. When the
+   * quote total crosses QUOTE_FLAG_MIN the quote is flagged for STAFF
+   * ATTENTION on three surfaces — Axis (tag + activity), Intercom (stubbed
+   * until INTERCOM_TOKEN exists), and the sales channel (cart attributes on
+   * the permalink, which order-sync carries into the Axis order note) — plus
+   * a staff email via the stubbed outbox rail. CONVERSION IS NEVER GATED:
+   * this endpoint always returns a permalink when lines are mappable.
    */
   async convertQuote(email, ref) {
     const quote = await this.getQuote(email, ref);
 
-    // ----- P2-12 approval gate (fail closed) -----
-    if (approval.needsApproval(quote.total, this.cfg.quoteApprovalMin)) {
-      const flagged = approval.flagPending(quote.id, quote.total);
-      if (flagged.state !== "approved") {
-        if (flagged.created) {
-          // Axis-side flag for desk visibility (tag first, note marker as
-          // fallback) — best-effort; the proxy store is authoritative.
-          this.flagAxisApproval(quote.id).catch((e) => console.warn("[approval] Axis flag failed:", e.message));
-          // Approver email via the SAME stubbed outbox rail as every other
-          // lifecycle email (no second mail path).
-          const approveUrl =
-            (this.cfg.storefrontUrl || "https://www.portlandiaelectric.supply") +
-            "/apps/quotes/approve?token=" + flagged.token;
+    // ----- P2-12 flag fan-out (never blocks; store errors never throw) -----
+    let flagState = approval.infoFor(quote.id, quote.total, this.cfg.quoteFlagMin);
+    if (flagState.required) {
+      try {
+        const rec = approval.flagForReview(quote.id, quote.total);
+        flagState = { ...flagState, flagged: true, flagged_at: rec.flagged_at };
+        if (rec.created) {
+          // Fire-and-forget fan-out; notification failures never affect convert.
+          this.flagAxisReview(quote.id, quote, rec.flagged_at)
+            .catch((e) => console.warn("[flag] Axis flag failed:", e.message));
           this.mailer.queue(
-            "approval_required",
-            {
-              email: this.cfg.quoteApproverEmail,
-              customerEmail: email,
-              quote,
-              approveUrl,
-              threshold: this.cfg.quoteApprovalMin,
-            },
-            { to: this.cfg.quoteApproverEmail, dedupeKey: `approval:${quote.id}` }
-          ).catch((e) => console.warn("[mailer] approval_required:", e.message));
+            "quote_flagged",
+            { email: this.cfg.quoteFlagEmail, customerEmail: email, quote, threshold: this.cfg.quoteFlagMin },
+            { to: this.cfg.quoteFlagEmail, dedupeKey: `flag:${quote.id}` }
+          ).catch((e) => console.warn("[mailer] quote_flagged:", e.message));
+          this.intercom.notifyFlag(
+            { quote, customerEmail: email, threshold: this.cfg.quoteFlagMin, flaggedAt: rec.flagged_at },
+            { dedupeKey: `flag:${quote.id}` }
+          ).catch((e) => console.warn("[intercom] quote flag:", e.message));
         }
-        return {
-          pending_approval: true,
-          approval_required: true,
-          quote_no: quote.quote_no,
-          name: quote.name,
-          total: quote.total,
-          threshold: this.cfg.quoteApprovalMin,
-          approval: { state: "pending", flagged_at: flagged.flagged_at || null },
-          message:
-            "This quote is over the approval threshold and is pending approval by our team. " +
-            "Checkout unlocks as soon as it is approved — no action needed on your side.",
-          footer: QUOTE_FOOTER.replace("{expiry}", quote.expiry || ""),
-        };
+      } catch (e) {
+        console.warn("[flag] flag store write failed (convert proceeds anyway):", e.message);
       }
     }
 
@@ -672,7 +665,11 @@ class QuoteService {
       }
     }
     if (!items.length) throw badRequest("no quotable lines could be mapped to Shopify variants");
-    const permalink = "/cart/" + items.map((i) => `${i.variant_id}:${i.qty}`).join(",");
+    // Sales-channel flag surface: cart attributes ride the permalink onto the
+    // Shopify order (admin-visible note attributes) and order-sync copies them
+    // into the Axis order note. Internal-only codes, never customer prose.
+    const permalink = "/cart/" + items.map((i) => `${i.variant_id}:${i.qty}`).join(",") +
+      (flagState.required ? flagQueryString(quote.quote_no) : "");
     // Wave-1 lifecycle email: converted (to owner). The cart URL is relative
     // to the storefront; the mailer prefixes it.
     this.mailer.queue("converted", {
@@ -689,72 +686,69 @@ class QuoteService {
       skipped,
       drift,
       requires_review: drift.length > 0, // >3% drift => interstitial before checkout
-      approval: approval.infoFor(quote.id, quote.total, this.cfg.quoteApprovalMin), // Wave-2B
+      flag: flagState, // Wave-2B — informational; conversion already happened
       footer: QUOTE_FOOTER.replace("{expiry}", quote.expiry || ""),
     };
   }
 
-  /* ---------- Wave-2B: quote approval (P2-12) ---------- */
+  /* ---------- Wave-2B: quote flag for staff attention (P2-12, owner ruling) ---------- */
 
   /**
-   * Axis-side pending flag for desk visibility. Best-effort: the proxy
-   * approval store is authoritative; Axis only mirrors the state so a human
-   * looking at the sale.order sees it. Tag first (sale.order.tag
-   * search-or-create), note-marker fallback if the tag model/field refuses.
+   * Axis-side flag for staff visibility. Verified Odoo-19-safe pattern:
+   * `crm.tag` "pes_flag_review" on sale.order.tag_ids (the exact pattern
+   * order-sync uses — sale.order.tag does NOT exist on this DB) + a
+   * mail.activity ("To Do") assigned to the sync user so it lands in the
+   * ERP chatter/tasks. Note-marker fallback only if both fail.
+   * Best-effort: the proxy flag store is the audit of record.
    */
-  async flagAxisApproval(orderId) {
-    const TAG = "PES Approval Pending";
+  async flagAxisReview(orderId, quote, flaggedAt) {
+    const TAG = "pes_flag_review";
+    let tagOk = false;
     try {
-      let tagId = (await this.axis.search("sale.order.tag", [["name", "=", TAG]], { limit: 1 }))[0] || null;
-      if (!tagId) tagId = await this.axis.create("sale.order.tag", { name: TAG });
+      let tagId = (await this.axis.search("crm.tag", [["name", "=", TAG]], { limit: 1 }))[0] || null;
+      if (!tagId) tagId = await this.axis.create("crm.tag", { name: TAG, color: 3 });
       await this.axis.write("sale.order", [orderId], { tag_ids: [[4, tagId]] });
+      tagOk = true;
     } catch (e) {
-      console.warn("[approval] tag path failed, using note marker:", e.message);
-      const rows = await this.axis.read("sale.order", [orderId], ["note"]);
-      const cur = String((rows[0] && rows[0].note) || "");
-      if (!cur.includes("[PES-APPROVAL-PENDING]")) {
-        await this.axis.write("sale.order", [orderId], { note: (cur ? cur + " " : "") + "[PES-APPROVAL-PENDING]" });
+      console.warn("[flag] crm.tag path failed:", e.message);
+    }
+    const noteText =
+      `Quote ${quote.quote_no} flagged for staff attention — est. total $${Number(quote.total).toFixed(2)}, ` +
+      `threshold $${Number(this.cfg.quoteFlagMin).toFixed(2)}, flagged at ${flaggedAt || new Date().toISOString()}. ` +
+      `Conversion NOT blocked (owner ruling 2026-10-08).`;
+    try {
+      // Odoo's default activity type is "To-Do" in 19 (older DBs: "To Do") —
+      // match both, fall back to any first activity type.
+      let typeId = (await this.axis.search("mail.activity.type", [["name", "in", ["To-Do", "To Do", "Todo"]]], { limit: 1 }))[0] || null;
+      if (!typeId) typeId = (await this.axis.search("mail.activity.type", [], { limit: 1 }))[0] || null;
+      const modelId = (await this.axis.search("ir.model", [["model", "=", "sale.order"]], { limit: 1 }))[0] || null;
+      const uid = await this.axis.authenticate();
+      if (typeId && modelId) {
+        await this.axis.create("mail.activity", {
+          res_model_id: modelId,
+          res_id: orderId,
+          activity_type_id: typeId,
+          summary: "Quote flagged for staff attention",
+          note: noteText,
+          user_id: uid,
+        });
+        return; // tag + activity landed — done
+      }
+      throw new Error("mail.activity type/model lookup empty");
+    } catch (e) {
+      console.warn("[flag] mail.activity path failed:", e.message);
+    }
+    if (!tagOk) {
+      try {
+        const rows = await this.axis.read("sale.order", [orderId], ["note"]);
+        const cur = String((rows[0] && rows[0].note) || "");
+        if (!cur.includes("[PES-FLAG-REVIEW]")) {
+          await this.axis.write("sale.order", [orderId], { note: (cur ? cur + " " : "") + "[PES-FLAG-REVIEW]" });
+        }
+      } catch (e) {
+        console.warn("[flag] note-marker fallback failed:", e.message);
       }
     }
-  }
-
-  /** Remove the pending flag after approval (best-effort mirror of the store). */
-  async unflagAxisApproval(orderId) {
-    const TAG = "PES Approval Pending";
-    // Independent guards: sale.order.tag does not exist on every Odoo 19 DB,
-    // so a tag failure must never skip the note-marker cleanup.
-    try {
-      const tagId = (await this.axis.search("sale.order.tag", [["name", "=", TAG]], { limit: 1 }))[0] || null;
-      if (tagId) await this.axis.write("sale.order", [orderId], { tag_ids: [[3, tagId]] });
-    } catch (e) {
-      console.warn("[approval] tag unflag skipped:", e.message);
-    }
-    try {
-      const rows = await this.axis.read("sale.order", [orderId], ["note"]);
-      const cur = String((rows[0] && rows[0].note) || "");
-      if (cur.includes("[PES-APPROVAL-PENDING]")) {
-        await this.axis.write("sale.order", [orderId], { note: cur.replace(/\s*\[PES-APPROVAL-PENDING\]/g, "") });
-      }
-    } catch (e) {
-      console.warn("[approval] note unflag skipped:", e.message);
-    }
-  }
-
-  /**
-   * Approve a quote via a single-use 72h token from the approver email.
-   * The token is the capability (no session); failures never mutate state.
-   */
-  async approveQuoteByToken(token) {
-    const { order_id } = approval.approveToken(token); // throws 400/404/409/410
-    // Awaited so the Axis mirror is accurate when the confirmation renders;
-    // errors are logged, never thrown (proxy store stays authoritative).
-    await this.unflagAxisApproval(order_id);
-    let quoteNo = null;
-    try {
-      const rows = await this.axis.read("sale.order", [order_id], ["name"]);
-      quoteNo = rows[0] ? rows[0].name : null;
-    } catch { /* quote number is cosmetic on the confirmation page */ }
-    return { approved: true, order_id, quote_no: quoteNo };
   }
 
   /* ---------- Wave-2B: customer part-number aliases (#109) ---------- */
@@ -957,6 +951,20 @@ function cleanName(name) {
   return String(name || "").replace(/^\[[^\]]*\]\s*/, "");
 }
 
+/**
+ * Wave-2B (owner ruling 2026-10-08): cart-attribute query string appended to
+ * a flagged quote's convert permalink. Shopify turns attributes[...] params
+ * into order note_attributes (visible in Shopify admin); order-sync copies
+ * them into the Axis order note. Internal-only codes — never customer prose.
+ * Pure function (unit-tested).
+ */
+function flagQueryString(quoteNo) {
+  return (
+    "?attributes[pes-flag]=quote-review-needed" +
+    "&attributes[pes-quote-no]=" + encodeURIComponent(String(quoteNo || ""))
+  );
+}
+
 function daysBetween(a, b) {
   return Math.round((new Date(b) - new Date(a)) / 86400000);
 }
@@ -970,4 +978,4 @@ class HttpError extends Error {
 function badRequest(msg) { return new HttpError(400, msg); }
 function notFound(msg) { return new HttpError(404, msg); }
 
-module.exports = { QuoteService, HttpError, QUOTE_FOOTER };
+module.exports = { QuoteService, HttpError, QUOTE_FOOTER, flagQueryString };

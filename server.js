@@ -235,7 +235,8 @@ async function main() {
           sku_map: skuMap.stats(),
           dev_mode: !cfg.shopify.appSecret,
           mail_rail: svc.mailer.railStatus(), // "resend" or STUBBED "stubbed-no-rail"
-          quote_approval_min: cfg.quoteApprovalMin, // Wave-2B (P2-12) threshold
+          intercom_rail: svc.intercom.railStatus(), // "intercom" or STUBBED "stubbed-no-token"
+          quote_flag_min: cfg.quoteFlagMin, // Wave-2B flag threshold (never blocks)
           order_sync: { configured: orderSync.configured(), loop_enabled: !!orderSync.timer },
         });
         return;
@@ -344,22 +345,18 @@ async function main() {
         return;
       }
 
-      // Wave-2B (P2-12): approver link target. The single-use 72h token is the
-      // capability — no email/login required (the approver clicks from email).
-      // Served through the Shopify-signed proxy path (/apps/quotes/approve),
-      // so HMAC verification above still applies. ALWAYS returns HTML.
+      // Wave-2B (P2-12): RETIRED approve-link target. Owner ruling
+      // 2026-10-08: quotes are flagged for staff attention, NEVER blocked —
+      // the single-use approve-token machinery was dropped. Any old emailed
+      // link gets a clear 410 Gone page; nothing is gated anymore.
       if (ref === "approve" && !action && req.method === "GET") {
-        try {
-          const out = await svc.approveQuoteByToken(query.token);
-          sendHtml(res, 200, {
-            ok: true,
-            title: `Quote ${out.quote_no || ""} approved`,
-            message: "The quote is approved and checkout is now unlocked for the customer. You can close this tab.",
-          });
-        } catch (e) {
-          const status = e.status || 400;
-          sendHtml(res, status, { ok: false, title: "Approval link not accepted", message: e.message });
-        }
+        sendHtml(res, 410, {
+          ok: false,
+          title: "Approval links are no longer used",
+          message: "Quotes are never blocked pending approval — they convert freely. " +
+            "Our team is notified internally about large quotes. If you reached this page " +
+            "from an older email, no action is needed.",
+        });
         return;
       }
 

@@ -274,6 +274,15 @@ class OrderSyncService {
     }
     if (REFUNDED.has(fs0)) parts.push(`REFUNDED on Shopify (financial_status=${fs0}) — reconcile before fulfillment.`);
     parts.push(`Shopify total ${order.total_price} ${order.currency} (incl. ${order.total_tax} tax / shipping) is authoritative; Axis untaxed = line sum and Axis total may add Axis-computed tax (shipping/tax not synced as lines).`);
+    // Wave-2B: quote-flag cart attributes (set on the convert permalink) ride
+    // onto the Shopify order as note_attributes — carry them into the Axis
+    // note so the staff flag survives the sync.
+    const attrs = Array.isArray(order.note_attributes) ? order.note_attributes : [];
+    const flagAttr = attrs.find((a) => a && a.name === "pes-flag" && a.value === "quote-review-needed");
+    if (flagAttr) {
+      const qno = (attrs.find((a) => a && a.name === "pes-quote-no") || {}).value || "unknown";
+      parts.push(`QUOTE REVIEW FLAG: order originated from quote ${qno} over the flag threshold — staff attention requested (customer was never blocked).`);
+    }
     if (deadLines.length) parts.push(`WARNING: ${deadLines.length} line(s) dead-lettered (SKU not in Axis) — see order-sync dead-letter log.`);
     return "<p>" + parts.join("<br/>") + "</p>";
   }

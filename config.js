@@ -81,12 +81,17 @@ function loadConfig() {
     resendApiKey: process.env.RESEND_API_KEY || null,
     mailFrom: process.env.MAIL_FROM || "PES Supply <sales@portlandiaelectric.supply>",
     storefrontUrl: (process.env.STOREFRONT_URL || "https://www.portlandiaelectric.supply").replace(/\/+$/, ""),
-    // Wave-2B (P2-12): quote approval threshold. A quote whose total reaches
-    // this amount enters "pending approval" at conversion time; the approver
-    // gets an outbox email with a single-use 72h approve link. <= 0 disables
-    // the gate. Unknown approval state fails CLOSED (not convertible).
-    quoteApprovalMin: parseFloat(process.env.QUOTE_APPROVAL_MIN || "10000"),
-    quoteApproverEmail: process.env.QUOTE_APPROVER_EMAIL || "sales@portlandiaelectric.supply",
+    // Wave-2B (P2-12) quote FLAG threshold — owner ruling 2026-10-08:
+    // "flagged for staff attention, NEVER blocked." Over-threshold quotes are
+    // flagged (Axis + Intercom + outbox email + cart attributes) but convert
+    // freely. <= 0 disables flagging. Legacy env QUOTE_APPROVAL_MIN honored.
+    quoteFlagMin: parseFloat(process.env.QUOTE_FLAG_MIN || process.env.QUOTE_APPROVAL_MIN || "10000"),
+    quoteFlagEmail: process.env.QUOTE_FLAG_EMAIL || process.env.QUOTE_APPROVER_EMAIL || "sales@portlandiaelectric.supply",
+    // Intercom rail (Wave-2B). STUBBED without INTERCOM_TOKEN — composed to
+    // data/intercom-outbox.json, nothing posted. No token exists in KV
+    // (kv-riven-ops-eus inventory checked 2026-10-08).
+    intercomToken: process.env.INTERCOM_TOKEN || null,
+    intercomAdminId: process.env.INTERCOM_ADMIN_ID || null,
   };
 }
 
