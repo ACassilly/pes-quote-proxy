@@ -2,20 +2,19 @@
 /*
  * intercom.js — Wave-2B owner ruling: staff flag notification on Intercom.
  *
- * INTERCOM RAIL — READ THIS FIRST:
- *   The client is STUBBED unless INTERCOM_TOKEN is set in the environment.
- *   As of 2026-10-08 NO Intercom credential exists: Azure Key Vault
- *   (kv-riven-ops-eus) inventory checked — no Intercom/Intercom-adjacent
- *   secret; container env likewise has none. Without the token every
- *   notification is composed fully and appended to data/intercom-outbox.json
- *   with status "stubbed-no-token" and a loud log line. NOTHING leaves the box.
- *   THE ONE ENV VAR THAT TURNS IT ON: INTERCOM_TOKEN (Intercom access token),
- *   plus INTERCOM_ADMIN_ID (the admin the note is attributed to).
+ * INTERCOM RAIL — LIVE SINCE 2026-10-08:
+ *   INTERCOM_TOKEN + INTERCOM_ADMIN_ID are set as ACI env vars (token sourced
+ *   from Azure KV `intercom-access-token`, workspace lt1fbeyf, authenticates
+ *   as alex@pes.supply). Without the token every notification is composed and
+ *   appended to data/intercom-outbox.json with status "stubbed-no-token";
+ *   with it, notes post for real (status "posted", provider_id = note id).
  *
- * Live behavior once enabled: find the contact by email (POST /contacts/
- * search); if found, create an internal note on the contact (POST /notes) —
- * the team sees it in the inbox; if no contact exists, the note is recorded
- * in the outbox with status "no-contact" for manual handling.
+ * Live behavior: find the contact by email (POST /contacts/search); if
+ * missing, create a lead contact (the flagging customer is by definition
+ * engaged). The note is created CONTACT-SCOPED — POST /contacts/{id}/notes;
+ * the legacy global POST /notes path 404s on this workspace (verified
+ * 2026-10-08). Notes are authored by INTERCOM_ADMIN_ID (alex@pes.supply =
+ * 11175212).
  *
  * Errors NEVER throw into the quote flow.
  */
@@ -160,20 +159,25 @@ class IntercomFlag {
       const search = await postJson(this.token, "/contacts/search", {
         query: { field: "email", operator: "=", value: ctx.customerEmail },
       });
-      const contact = search && Array.isArray(search.data) && search.data[0];
+      let contact = search && Array.isArray(search.data) && search.data[0];
       if (!contact) {
-        row.status = "no-contact";
-        appendOutbox(row);
-        console.warn(`[intercom] no contact for ${ctx.customerEmail} — note recorded in outbox only`);
-        return { status: "no-contact" };
+        // The flagging customer is by definition engaged — create a lead so
+        // the staff note has somewhere to live.
+        contact = await postJson(this.token, "/contacts", {
+          role: "lead",
+          email: ctx.customerEmail,
+        });
+        row.contact_created = true;
       }
-      const note = await postJson(this.token, "/notes", {
-        contact_id: contact.id,
+      // Contact-scoped notes path — global POST /notes 404s on this workspace
+      // (verified 2026-10-08, workspace lt1fbeyf).
+      const note = await postJson(this.token, `/contacts/${contact.id}/notes`, {
         admin_id: this.adminId,
         body: msg.body,
       });
       row.status = "posted";
       row.provider_id = note && note.id ? note.id : null;
+      row.contact_id = contact.id;
       appendOutbox(row);
       console.log(`[intercom] posted flag note (id ${row.provider_id})`);
       return { status: "posted", id: row.provider_id };

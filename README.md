@@ -37,9 +37,10 @@ in-process day-5-of-7 expiring-quote sweep),
 2026-10-08: over-threshold quotes are FLAGGED for staff attention, NEVER
 blocked), `QUOTE_FLAG_EMAIL` (staff notification mailbox, legacy
 `QUOTE_APPROVER_EMAIL` honored, default `sales@portlandiaelectric.supply`),
-`INTERCOM_TOKEN` + `INTERCOM_ADMIN_ID` (Wave-2B Intercom rail — UNSET means
-flag notes are composed to `data/intercom-outbox.json` but NOTHING is posted;
-no Intercom token exists in KV as of 2026-10-08),
+`INTERCOM_TOKEN` + `INTERCOM_ADMIN_ID` (Wave-2B Intercom rail — **LIVE since
+2026-10-08**: token in KV `intercom-access-token`, set as ACI secure env;
+admin id 11175212 = alex@pes.supply. UNSET means flag notes compose to
+`data/intercom-outbox.json` and NOTHING is posted),
 `ORDER_SYNC_ENABLED`, `ORDER_SYNC_ADMIN_TOKEN` (Stitch-2 Shopify→Axis order
 sync; loop off and admin routes 404 unless set).
 
